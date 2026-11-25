@@ -578,6 +578,8 @@ fun CaptureDeckScreen(
                     )
                 }
 
+                val pipelineBusy = pipelineState.isExtracting || pipelineState.activeStepMessage != null
+
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -588,6 +590,7 @@ fun CaptureDeckScreen(
                     ) {
                         Button(
                             onClick = { onSubmitCommand("capture nameplate") },
+                            enabled = !pipelineBusy,
                             modifier = Modifier
                                 .weight(1f)
                                 .heightIn(min = 48.dp)
@@ -601,6 +604,7 @@ fun CaptureDeckScreen(
                             onClick = {
                                 onSubmitCommand("note: Active moisture staining near $selectedRoom $selectedSurface; verify shutoff valve")
                             },
+                            enabled = !pipelineBusy,
                             modifier = Modifier
                                 .weight(1f)
                                 .heightIn(min = 48.dp)
@@ -613,6 +617,7 @@ fun CaptureDeckScreen(
                     }
                     FilledTonalButton(
                         onClick = { onSubmitCommand("capture damage $selectedRoom $selectedSurface") },
+                        enabled = !pipelineBusy,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
@@ -632,6 +637,7 @@ fun CaptureDeckScreen(
                     OutlinedTextField(
                         value = commandText,
                         onValueChange = { commandText = it },
+                        enabled = !pipelineBusy,
                         modifier = Modifier
                             .weight(1f)
                             .testTag("voice_command_input"),
@@ -645,6 +651,7 @@ fun CaptureDeckScreen(
                                 commandText = ""
                             }
                         },
+                        enabled = !pipelineBusy && commandText.isNotBlank(),
                         modifier = Modifier
                             .heightIn(min = 52.dp)
                             .testTag("voice_command_send_button")
@@ -654,16 +661,49 @@ fun CaptureDeckScreen(
                 }
 
                 pipelineState.commandFeedback?.let { msg ->
+                    val containerColor = if (pipelineState.feedbackIsError) {
+                        MaterialTheme.colorScheme.errorContainer
+                    } else {
+                        StatusEmerald.copy(alpha = 0.14f)
+                    }
+                    val contentColor = if (pipelineState.feedbackIsError) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    }
+                    val iconTint = if (pipelineState.feedbackIsError) {
+                        StatusCrimson
+                    } else {
+                        StatusEmerald
+                    }
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        color = containerColor,
                         shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("capture_command_feedback")
                     ) {
-                        Text(
-                            text = msg,
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.padding(10.dp)
-                        )
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (pipelineState.feedbackIsError) {
+                                    Icons.Default.Warning
+                                } else {
+                                    Icons.Default.CheckCircle
+                                },
+                                contentDescription = null,
+                                tint = iconTint,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = msg,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = contentColor
+                            )
+                        }
                     }
                 }
             }

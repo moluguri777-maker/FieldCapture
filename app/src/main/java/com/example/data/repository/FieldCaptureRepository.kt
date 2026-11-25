@@ -48,12 +48,23 @@ import java.io.FileOutputStream
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-class FieldCaptureRepository(
-    private val context: Context,
-    val transportConfig: SyncTransportConfig = SyncTransportConfig()
+import com.example.data.local.InspectionDao
+
+class FieldCaptureRepository internal constructor(
+    private val appContext: Context?,
+    private val dao: InspectionDao,
+    val transportConfig: SyncTransportConfig = SyncTransportConfig(),
+    private val scheduleWorkerOnEnqueue: Boolean = true
 ) {
-    private val appContext = context.applicationContext
-    private val dao = FieldCaptureDatabase.getInstance(appContext).inspectionDao()
+    constructor(
+        context: Context,
+        transportConfig: SyncTransportConfig = SyncTransportConfig()
+    ) : this(
+        appContext = context.applicationContext,
+        dao = FieldCaptureDatabase.getInstance(context.applicationContext).inspectionDao(),
+        transportConfig = transportConfig
+    )
+
     private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -118,25 +129,28 @@ class FieldCaptureRepository(
             createdAtEpochMs = now,
             updatedAtEpochMs = now
         )
-        dao.upsertJob(job)
-        job
+        dao.insertJobIfAbsent(job)
+        dao.getJobById(job.jobId) ?: job
     }
 
     suspend fun updateJobSessionTelemetry(jobId: String, sessionState: String, disconnectsRecovered: Int) {
         withContext(Dispatchers.IO) {
             val job = dao.getJobById(jobId) ?: return@withContext
-            dao.upsertJob(
-                job.copy(
-                    sessionState = sessionState,
-                    disconnectsRecovered = disconnectsRecovered,
-                    updatedAtEpochMs = System.currentTimeMillis()
-                )
+            if (job.sessionState == sessionState && job.disconnectsRecovered == disconnectsRecovered) {
+                return@withContext
+            }
+            dao.updateJobSessionTelemetry(
+                jobId = jobId,
+                sessionState = sessionState,
+                disconnectsRecovered = disconnectsRecovered,
+                updatedAtEpochMs = System.currentTimeMillis()
             )
         }
     }
 
     suspend fun saveCaptureImage(captureId: String, bitmap: Bitmap): String = withContext(Dispatchers.IO) {
-        val dir = File(appContext.filesDir, "captures").apply { mkdirs() }
+        val ctx = checkNotNull(appContext) { "Context required to save capture image" }
+        val dir = File(ctx.filesDir, "captures").apply { mkdirs() }
         val file = File(dir, "$captureId.jpg")
         FileOutputStream(file).use { out ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
@@ -172,6 +186,11 @@ class FieldCaptureRepository(
             createdAtEpochMs = System.currentTimeMillis()
         )
         dao.upsertCapture(entity)
+        dao.updateJobSyncState(
+            jobId = jobId,
+            syncStatus = SyncStatus.QUEUED.name,
+            updatedAtEpochMs = System.currentTimeMillis()
+        )
     }
 
     suspend fun updateCaptureWithExtraction(
@@ -185,7 +204,8 @@ class FieldCaptureRepository(
         qualityLatencyMs: Long,
         sourceMode: String = "LIVE_CAPTURE"
     ) = withContext(Dispatchers.IO) {
-        val existing = dao.getCaptureById(captureId) ?: return@withContext
+        val existing = dao.getCaptureById(captureId)
+            ?: throw IllegalStateException("Capture record $captureId was not found in local database.")
         val updated = existing.copy(
             extractionJson = bundle?.let { json.encodeToString(it) },
             extractionError = errorMessage,
@@ -193,6 +213,11 @@ class FieldCaptureRepository(
             estimateCodesJson = json.encodeToString(bundle?.suggestedEstimateCodes ?: emptyList<String>())
         )
         dao.upsertCapture(updated)
+        dao.updateJobSyncState(
+            jobId = existing.jobId,
+            syncStatus = SyncStatus.QUEUED.name,
+            updatedAtEpochMs = System.currentTimeMillis()
+        )
 
         dao.insertTelemetry(
             TelemetryMetricEntity(
@@ -343,6 +368,8 @@ class FieldCaptureRepository(
     }
 
     fun scheduleAutoSyncWorker() {
+        if (!scheduleWorkerOnEnqueue) return
+        val ctx = appContext ?: return
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
@@ -350,7 +377,7 @@ class FieldCaptureRepository(
             .setConstraints(constraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
             .build()
-        WorkManager.getInstance(appContext).enqueueUniqueWork(
+        WorkManager.getInstance(ctx).enqueueUniqueWork(
             "fieldcapture_outbox_sync",
             ExistingWorkPolicy.REPLACE,
             work
@@ -358,7 +385,8 @@ class FieldCaptureRepository(
     }
 
     fun isNetworkConnected(): Boolean {
-        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val ctx = appContext ?: return false
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val net = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(net) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -412,15 +440,12 @@ class FieldCaptureRepository(
                         idempotencyKey = item.idempotencyKey,
                         jobRecordJson = body
                     )
-                    dao.getJobById(item.jobId)?.let { job ->
-                        dao.upsertJob(
-                            job.copy(
-                                serverRevision = resp.serverRevision,
-                                syncStatus = SyncStatus.SYNCED.name,
-                                updatedAtEpochMs = System.currentTimeMillis()
-                            )
-                        )
-                    }
+                    dao.updateJobSynced(
+                        jobId = item.jobId,
+                        serverRevision = resp.serverRevision,
+                        syncStatus = SyncStatus.SYNCED.name,
+                        updatedAtEpochMs = System.currentTimeMillis()
+                    )
                     dao.getCapturesForJob(item.jobId).forEach { cap ->
                         if (cap.syncStatus != SyncStatus.SYNCED.name) {
                             dao.upsertCapture(cap.copy(syncStatus = SyncStatus.SYNCED.name))

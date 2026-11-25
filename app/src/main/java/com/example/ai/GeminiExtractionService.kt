@@ -16,7 +16,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import org.json.JSONObject
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.math.max
 
 private const val TAG = "GeminiExtraction"
@@ -53,7 +59,7 @@ class GeminiExtractionService {
                 "manufacturer" to confidenceFieldSchema("Manufacturer / brand name"),
                 "modelNumber" to confidenceFieldSchema("Exact model number printed on nameplate"),
                 "serialNumber" to confidenceFieldSchema("Exact serial number printed on nameplate"),
-                "manufactureYear" to confidenceFieldSchema("4-digit year or unknown"),
+                "manufactureDate" to confidenceFieldSchema("Manufacture date or 4-digit year if visibly printed on nameplate, or Unknown"),
                 "voltagePhase" to confidenceFieldSchema("Voltage and phase rating e.g. 208-230V 1PH"),
                 "amperageOrBtu" to confidenceFieldSchema("Max fuse/breaker amperage or BTU capacity"),
                 "refrigerantType" to confidenceFieldSchema("Refrigerant type e.g. R-410A or N/A"),
@@ -209,7 +215,8 @@ class GeminiExtractionService {
             CaptureCommandType.NAMEPLATE -> """
                 You are a field HVAC and electrical inspection extractor.
                 Analyze the captured nameplate photo and voice command ("$transcript").
-                Extract every field accurately. If a field is unreadable or absent, set value to "Unknown" with low confidence (< 0.45).
+                Extract equipmentType, manufacturer, modelNumber, serialNumber, manufactureDate (if visibly printed), voltagePhase, amperageOrBtu, and refrigerantType accurately.
+                Only report values supported by the image or voice command. If a field is unreadable or absent, set value to "Unknown" with low confidence (< 0.45).
                 Provide calibrated confidence in [0.0, 1.0] for each field.
                 Select matching estimate codes from:
                 $codeCatalogText
@@ -234,12 +241,12 @@ class GeminiExtractionService {
         }
     }
 
-    private fun parseStructuredBundle(rawJson: String, type: CaptureCommandType): ExtractedDataBundle {
-        val json = JSONObject(rawJson)
+    internal fun parseStructuredBundle(rawJson: String, type: CaptureCommandType): ExtractedDataBundle {
+        val json = Json.parseToJsonElement(rawJson).jsonObject
         val expectedKeys = when (type) {
             CaptureCommandType.NAMEPLATE -> listOf(
                 "equipmentType", "manufacturer", "modelNumber", "serialNumber",
-                "manufactureYear", "voltagePhase", "amperageOrBtu", "refrigerantType"
+                "manufactureDate", "voltagePhase", "amperageOrBtu", "refrigerantType"
             )
             CaptureCommandType.DAMAGE -> listOf(
                 "room", "surface", "damageType", "severity",
@@ -252,10 +259,11 @@ class GeminiExtractionService {
 
         val fieldMap = linkedMapOf<String, ConfidenceField>()
         for (key in expectedKeys) {
-            val obj = json.optJSONObject(key)
+            val obj = (json[key] as? JsonObject)
+                ?: if (key == "manufactureDate") (json["manufactureYear"] as? JsonObject) else null
             if (obj != null) {
-                val valStr = obj.optString("value", "Unknown").ifBlank { "Unknown" }
-                val conf = obj.optDouble("confidence", 0.5).toFloat().coerceIn(0f, 1f)
+                val valStr = obj["value"]?.jsonPrimitive?.contentOrNull?.ifBlank { "Unknown" } ?: "Unknown"
+                val conf = (obj["confidence"]?.jsonPrimitive?.doubleOrNull ?: 0.5).toFloat().coerceIn(0f, 1f)
                 fieldMap[key] = ConfidenceField(
                     value = valStr,
                     confidence = conf,
@@ -273,14 +281,14 @@ class GeminiExtractionService {
         val summary = if (type == CaptureCommandType.NOTE) {
             fieldMap["summary"]?.value ?: "Technician field note"
         } else {
-            json.optString("summary", "Inspection capture extracted")
+            json["summary"]?.jsonPrimitive?.contentOrNull?.ifBlank { null } ?: "Inspection capture extracted"
         }
 
-        val codesJson = json.optJSONArray("estimateCodes")
+        val codesJson = runCatching { json["estimateCodes"]?.jsonArray }.getOrNull()
         val codes = mutableListOf<String>()
         if (codesJson != null) {
-            for (i in 0 until codesJson.length()) {
-                val c = codesJson.optString(i)
+            for (elem in codesJson) {
+                val c = elem.jsonPrimitive.contentOrNull ?: continue
                 if (EstimateCodeCatalog.byCode(c) != null && !codes.contains(c)) {
                     codes += c
                 }

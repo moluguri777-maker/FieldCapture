@@ -3,6 +3,7 @@ package com.example.ui.viewmodel
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.GeminiExtractionService
@@ -16,7 +17,6 @@ import com.example.domain.model.EvalBatchSummaryUi
 import com.example.domain.model.HttpTraceLog
 import com.example.domain.model.OutboxItemUi
 import com.example.domain.model.QualityReport
-import com.example.domain.model.SessionLifecycleState
 import com.example.domain.model.TelemetryRecordUi
 import com.example.eval.BatchEvaluationEngine
 import com.example.voice.ParsedVoiceCommand
@@ -28,18 +28,23 @@ import com.example.wearable.DatWearableSessionGateway
 import com.example.wearable.MockFeedScene
 import com.example.wearable.WearableGatewayState
 import com.example.wearable.WearableSessionGateway
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.UUID
+
+private const val VM_TAG = "FieldCaptureViewModel"
 
 data class PendingQualityReview(
     val command: ParsedVoiceCommand,
@@ -51,6 +56,7 @@ data class CapturePipelineUiState(
     val isExtracting: Boolean = false,
     val activeStepMessage: String? = null,
     val commandFeedback: String? = null,
+    val feedbackIsError: Boolean = false,
     val pendingQualityReview: PendingQualityReview? = null,
     val liveQualityPreview: QualityReport? = null,
     val isDarkFieldTheme: Boolean = true
@@ -79,8 +85,10 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     @Suppress("OPT_IN_USAGE")
     val captures: StateFlow<List<CaptureEvidenceUi>> = activeJob
-        .flatMapLatest { job ->
-            if (job == null) flowOf(emptyList()) else repository.observeCaptures(job.jobId)
+        .map { it?.jobId }
+        .distinctUntilChanged()
+        .flatMapLatest { jobId ->
+            if (jobId == null) flowOf(emptyList()) else repository.observeCaptures(jobId)
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -118,18 +126,34 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
             repository.ensureDefaultJob()
         }
         viewModelScope.launch {
-            combine(activeJob, wearableState) { job, hw -> job to hw }
-                .collect { (job, hw) ->
-                    if (job != null) {
-                        repository.updateJobSessionTelemetry(
-                            jobId = job.jobId,
-                            sessionState = hw.lifecycleState.name,
-                            disconnectsRecovered = hw.disconnectsRecovered
-                        )
-                    }
-                    hw.previewFrame?.let { frame ->
-                        val previewReport = qualityAnalyzer.analyze(frame, CaptureCommandType.NAMEPLATE)
-                        _pipelineState.value = _pipelineState.value.copy(liveQualityPreview = previewReport)
+            combine(
+                activeJob.map { it?.jobId }.filterNotNull().distinctUntilChanged(),
+                wearableState.map { it.lifecycleState.name to it.disconnectsRecovered }.distinctUntilChanged()
+            ) { jobId, (sessionState, disconnects) ->
+                Triple(jobId, sessionState, disconnects)
+            }.collect { (jobId, sessionState, disconnects) ->
+                runCatching {
+                    repository.updateJobSessionTelemetry(
+                        jobId = jobId,
+                        sessionState = sessionState,
+                        disconnectsRecovered = disconnects
+                    )
+                }.onFailure { err ->
+                    Log.e(VM_TAG, "Failed to update job session telemetry", err)
+                }
+            }
+        }
+        viewModelScope.launch {
+            wearableState
+                .map { it.previewFrame }
+                .distinctUntilChanged()
+                .collect { frame ->
+                    if (frame != null) {
+                        runCatching {
+                            qualityAnalyzer.analyze(frame, CaptureCommandType.NAMEPLATE)
+                        }.onSuccess { previewReport ->
+                            _pipelineState.value = _pipelineState.value.copy(liveQualityPreview = previewReport)
+                        }
                     }
                 }
         }
@@ -164,70 +188,96 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
             is VoiceParseResult.Matched -> executeParsedCommand(parsed.command)
             is VoiceParseResult.Unrecognized -> {
                 _pipelineState.value = _pipelineState.value.copy(
-                    commandFeedback = parsed.hint
+                    commandFeedback = parsed.hint,
+                    feedbackIsError = true
                 )
             }
         }
     }
 
     private fun executeParsedCommand(command: ParsedVoiceCommand) {
+        if (_pipelineState.value.isExtracting || _pipelineState.value.activeStepMessage != null) {
+            return
+        }
         viewModelScope.launch {
-            val sessionState = wearableState.value.lifecycleState
-            if (command.commandType != CaptureCommandType.NOTE &&
-                sessionState != SessionLifecycleState.STREAMING &&
-                sessionState != SessionLifecycleState.PAIRED_IDLE
-            ) {
-                if (!wearableState.value.hardware.paired) {
-                    wearableGateway.pairMockGlasses()
+            try {
+                if (command is ParsedVoiceCommand.TechnicianNote) {
+                    val attachedFrame = wearableState.value.previewFrame
+                    val dummyQuality = QualityReport(
+                        passed = true,
+                        blurScore = 100.0,
+                        brightnessScore = 128.0,
+                        framingScore = 1.0,
+                        darkPixelRatio = 0.0,
+                        clippedPixelRatio = 0.0,
+                        issues = emptyList(),
+                        summaryMessage = "Voice Note (visual context optional)",
+                        latencyMs = 1L
+                    )
+                    persistAndExtract(
+                        command = command,
+                        bitmap = attachedFrame,
+                        qualityReport = dummyQuality
+                    )
+                    return@launch
                 }
-            }
 
-            if (command is ParsedVoiceCommand.TechnicianNote) {
-                val attachedFrame = wearableState.value.previewFrame
-                val dummyQuality = QualityReport(
-                    passed = true,
-                    blurScore = 100.0,
-                    brightnessScore = 128.0,
-                    framingScore = 1.0,
-                    darkPixelRatio = 0.0,
-                    clippedPixelRatio = 0.0,
-                    issues = emptyList(),
-                    summaryMessage = "Voice Note (visual context optional)",
-                    latencyMs = 1L
-                )
-                persistAndExtract(
-                    command = command,
-                    bitmap = attachedFrame,
-                    qualityReport = dummyQuality
-                )
-                return@launch
-            }
+                if (!wearableState.value.hardware.paired) {
+                    _pipelineState.value = _pipelineState.value.copy(
+                        activeStepMessage = "Pairing Mock Glasses via Meta DAT 1.0…",
+                        commandFeedback = null,
+                        feedbackIsError = false
+                    )
+                    val paired = wearableGateway.ensureMockGlassesPaired()
+                    if (!paired) {
+                        _pipelineState.value = _pipelineState.value.copy(
+                            activeStepMessage = null,
+                            commandFeedback = wearableState.value.lastError ?: "Unable to pair glasses for capture.",
+                            feedbackIsError = true
+                        )
+                        return@launch
+                    }
+                }
 
-            _pipelineState.value = _pipelineState.value.copy(
-                activeStepMessage = "Capturing frame via Meta DAT 1.0…",
-                commandFeedback = null
-            )
-
-            val captureResult = wearableGateway.capturePhotoFrame()
-            captureResult.onFailure { err ->
                 _pipelineState.value = _pipelineState.value.copy(
-                    activeStepMessage = null,
-                    commandFeedback = "Capture failed: ${err.localizedMessage}"
+                    activeStepMessage = "Capturing frame via Meta DAT 1.0…",
+                    commandFeedback = null,
+                    feedbackIsError = false
                 )
-            }.onSuccess { bmp ->
-                _pipelineState.value = _pipelineState.value.copy(
-                    activeStepMessage = "Running on-device quality gates (blur / darkness / framing)…"
-                )
-                val qReport = qualityAnalyzer.analyze(bmp, command.commandType)
-                if (!qReport.passed) {
+
+                val captureResult = wearableGateway.capturePhotoFrame()
+                captureResult.onFailure { err ->
                     _pipelineState.value = _pipelineState.value.copy(
                         activeStepMessage = null,
-                        pendingQualityReview = PendingQualityReview(command, bmp, qReport),
-                        commandFeedback = qReport.summaryMessage
+                        commandFeedback = "Capture failed: ${err.localizedMessage ?: "No camera frame available"}",
+                        feedbackIsError = true
                     )
-                } else {
-                    persistAndExtract(command, bmp, qReport)
+                }.onSuccess { bmp ->
+                    _pipelineState.value = _pipelineState.value.copy(
+                        activeStepMessage = "Running on-device quality gates (blur / darkness / framing)…"
+                    )
+                    val qReport = qualityAnalyzer.analyze(bmp, command.commandType)
+                    if (!qReport.passed) {
+                        _pipelineState.value = _pipelineState.value.copy(
+                            activeStepMessage = null,
+                            pendingQualityReview = PendingQualityReview(command, bmp, qReport),
+                            commandFeedback = qReport.summaryMessage,
+                            feedbackIsError = true
+                        )
+                    } else {
+                        persistAndExtract(command, bmp, qReport)
+                    }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(VM_TAG, "Unexpected capture pipeline error", e)
+                _pipelineState.value = _pipelineState.value.copy(
+                    isExtracting = false,
+                    activeStepMessage = null,
+                    commandFeedback = "Capture failed: ${e.localizedMessage ?: "Unexpected error"}",
+                    feedbackIsError = true
+                )
             }
         }
     }
@@ -245,7 +295,8 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
         _pipelineState.value.pendingQualityReview ?: return
         _pipelineState.value = _pipelineState.value.copy(
             pendingQualityReview = null,
-            commandFeedback = "Discarded low-quality frame — adjust lighting/framing and retry."
+            commandFeedback = "Discarded low-quality frame — adjust lighting/framing and retry.",
+            feedbackIsError = false
         )
     }
 
@@ -254,26 +305,40 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
         bitmap: Bitmap?,
         qualityReport: QualityReport
     ) {
-        val job = activeJob.value ?: repository.ensureDefaultJob()
         val captureId = "CAP-${UUID.randomUUID().toString().take(8).uppercase()}"
         val roomHint = (command as? ParsedVoiceCommand.CaptureDamage)?.room
         val surfaceHint = (command as? ParsedVoiceCommand.CaptureDamage)?.surface
 
-        val localPath = bitmap?.let { repository.saveCaptureImage(captureId, it) }
-        repository.saveInitialCapture(
-            captureId = captureId,
-            jobId = job.jobId,
-            commandType = command.commandType,
-            transcript = command.rawTranscript,
-            room = roomHint,
-            surface = surfaceHint,
-            localImagePath = localPath,
-            qualityReport = qualityReport
-        )
+        try {
+            val job = activeJob.value ?: repository.ensureDefaultJob()
+            val localPath = bitmap?.let { repository.saveCaptureImage(captureId, it) }
+            repository.saveInitialCapture(
+                captureId = captureId,
+                jobId = job.jobId,
+                commandType = command.commandType,
+                transcript = command.rawTranscript,
+                room = roomHint,
+                surface = surfaceHint,
+                localImagePath = localPath,
+                qualityReport = qualityReport
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(VM_TAG, "Failed to save capture evidence $captureId to Room", e)
+            _pipelineState.value = _pipelineState.value.copy(
+                isExtracting = false,
+                activeStepMessage = null,
+                commandFeedback = "Database save failed: ${e.localizedMessage ?: "Unable to persist capture"}",
+                feedbackIsError = true
+            )
+            return
+        }
 
         _pipelineState.value = _pipelineState.value.copy(
             isExtracting = true,
-            activeStepMessage = "Extracting fields & confidence via Gemini 3.8 Flash…"
+            activeStepMessage = "Extracting fields & confidence via Gemini 3.8 Flash…",
+            feedbackIsError = false
         )
 
         val aiRes = geminiService.extractEvidence(
@@ -285,36 +350,55 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
         )
 
         aiRes.onSuccess { outcome ->
-            repository.updateCaptureWithExtraction(
-                captureId = captureId,
-                bundle = outcome.bundle,
-                errorMessage = null,
-                aiLatencyMs = outcome.aiLatencyMs,
-                promptTokens = outcome.promptTokens,
-                outputTokens = outcome.outputTokens,
-                estimatedCostUsd = outcome.estimatedCostUsd,
-                qualityLatencyMs = qualityReport.latencyMs
-            )
-            _pipelineState.value = _pipelineState.value.copy(
-                isExtracting = false,
-                activeStepMessage = null,
-                commandFeedback = "Saved $captureId • Conf ${(outcome.bundle.overallConfidence * 100).toInt()}% • ${outcome.aiLatencyMs}ms"
-            )
+            try {
+                repository.updateCaptureWithExtraction(
+                    captureId = captureId,
+                    bundle = outcome.bundle,
+                    errorMessage = null,
+                    aiLatencyMs = outcome.aiLatencyMs,
+                    promptTokens = outcome.promptTokens,
+                    outputTokens = outcome.outputTokens,
+                    estimatedCostUsd = outcome.estimatedCostUsd,
+                    qualityLatencyMs = qualityReport.latencyMs
+                )
+                _pipelineState.value = _pipelineState.value.copy(
+                    isExtracting = false,
+                    activeStepMessage = null,
+                    commandFeedback = "Saved $captureId • Conf ${(outcome.bundle.overallConfidence * 100).toInt()}% • ${outcome.aiLatencyMs}ms",
+                    feedbackIsError = false
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(VM_TAG, "Failed to update extraction results for $captureId", e)
+                _pipelineState.value = _pipelineState.value.copy(
+                    isExtracting = false,
+                    activeStepMessage = null,
+                    commandFeedback = "Database error saving extraction: ${e.localizedMessage ?: "Unknown DB error"}",
+                    feedbackIsError = true
+                )
+            }
         }.onFailure { err ->
-            repository.updateCaptureWithExtraction(
-                captureId = captureId,
-                bundle = null,
-                errorMessage = err.localizedMessage ?: "AI extraction failed",
-                aiLatencyMs = 0L,
-                promptTokens = 0,
-                outputTokens = 0,
-                estimatedCostUsd = 0.0,
-                qualityLatencyMs = qualityReport.latencyMs
-            )
+            val errMsg = err.localizedMessage ?: "AI extraction failed"
+            runCatching {
+                repository.updateCaptureWithExtraction(
+                    captureId = captureId,
+                    bundle = null,
+                    errorMessage = errMsg,
+                    aiLatencyMs = 0L,
+                    promptTokens = 0,
+                    outputTokens = 0,
+                    estimatedCostUsd = 0.0,
+                    qualityLatencyMs = qualityReport.latencyMs
+                )
+            }.onFailure { dbErr ->
+                Log.e(VM_TAG, "Failed to store extraction error state for $captureId", dbErr)
+            }
             _pipelineState.value = _pipelineState.value.copy(
                 isExtracting = false,
                 activeStepMessage = null,
-                commandFeedback = "Queued $captureId offline (AI error: ${err.localizedMessage})"
+                commandFeedback = "Saved $captureId locally (AI error: $errMsg)",
+                feedbackIsError = true
             )
         }
     }

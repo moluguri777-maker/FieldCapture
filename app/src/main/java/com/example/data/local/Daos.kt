@@ -15,8 +15,37 @@ interface InspectionDao {
     @Query("SELECT * FROM inspection_jobs WHERE jobId = :jobId")
     suspend fun getJobById(jobId: String): InspectionJobEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertJob(job: InspectionJobEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertJobIfAbsent(job: InspectionJobEntity)
+
+    @Query(
+        "UPDATE inspection_jobs SET sessionState = :sessionState, disconnectsRecovered = :disconnectsRecovered, updatedAtEpochMs = :updatedAtEpochMs WHERE jobId = :jobId"
+    )
+    suspend fun updateJobSessionTelemetry(
+        jobId: String,
+        sessionState: String,
+        disconnectsRecovered: Int,
+        updatedAtEpochMs: Long
+    )
+
+    @Query(
+        "UPDATE inspection_jobs SET syncStatus = :syncStatus, updatedAtEpochMs = :updatedAtEpochMs WHERE jobId = :jobId"
+    )
+    suspend fun updateJobSyncState(
+        jobId: String,
+        syncStatus: String,
+        updatedAtEpochMs: Long
+    )
+
+    @Query(
+        "UPDATE inspection_jobs SET serverRevision = :serverRevision, syncStatus = :syncStatus, updatedAtEpochMs = :updatedAtEpochMs WHERE jobId = :jobId"
+    )
+    suspend fun updateJobSynced(
+        jobId: String,
+        serverRevision: Int,
+        syncStatus: String,
+        updatedAtEpochMs: Long
+    )
 
     @Query("SELECT * FROM capture_evidences WHERE jobId = :jobId ORDER BY createdAtEpochMs DESC")
     fun observeCapturesForJob(jobId: String): Flow<List<CaptureEvidenceEntity>>

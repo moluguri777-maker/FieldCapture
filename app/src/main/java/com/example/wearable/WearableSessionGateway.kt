@@ -72,6 +72,7 @@ interface WearableSessionGateway {
     fun resumeSession()
     fun stopSession()
     fun simulateUnexpectedDisconnect()
+    suspend fun ensureMockGlassesPaired(): Boolean
     suspend fun capturePhotoFrame(): Result<Bitmap>
     fun release()
 }
@@ -151,6 +152,12 @@ class DatWearableSessionGateway(
         scope.launch {
             pairMockGlassesInternal()
         }
+    }
+
+    override suspend fun ensureMockGlassesPaired(): Boolean {
+        if (_state.value.hardware.paired) return true
+        initializeSdk()
+        return pairMockGlassesInternal()
     }
 
     private suspend fun pairMockGlassesInternal(): Boolean {
@@ -497,15 +504,29 @@ class DatWearableSessionGateway(
     }
 
     override suspend fun capturePhotoFrame(): Result<Bitmap> = withContext(Dispatchers.IO) {
+        val snapshot = _state.value
+        if (snapshot.hardware.paired && (!snapshot.hardware.poweredOn || !snapshot.hardware.unfolded)) {
+            return@withContext Result.failure(
+                IllegalStateException("Glasses are powered off or folded — power on and unfold to capture.")
+            )
+        }
+        if (!snapshot.hardware.paired && snapshot.previewFrame == null) {
+            return@withContext Result.failure(
+                IllegalStateException("No camera stream active — pair glasses and tap Start before capturing.")
+            )
+        }
+
         val stream = activeStream
-        if (stream != null) {
-            val result = runCatching { stream.capturePhoto() }.getOrNull()
+        if (stream != null && snapshot.lifecycleState == SessionLifecycleState.STREAMING) {
+            val result = withTimeoutOrNull(4_000L) {
+                runCatching { stream.capturePhoto() }.getOrNull()
+            }
             if (result != null) {
                 var capturedBitmap: Bitmap? = null
                 result.onSuccess { photoData ->
                     capturedBitmap = when (photoData) {
-                        is PhotoData.Bitmap -> photoData.bitmap
-                        is PhotoData.HEIC -> decodeHeicByteBuffer(photoData.data)
+                        is PhotoData.Bitmap -> ensureSoftwareArgb8888(photoData.bitmap)
+                        is PhotoData.HEIC -> decodeHeicByteBuffer(photoData.data)?.let(::ensureSoftwareArgb8888)
                         else -> null
                     }
                 }.onFailure { err, _ ->
@@ -514,16 +535,28 @@ class DatWearableSessionGateway(
                 if (capturedBitmap != null) {
                     return@withContext Result.success(capturedBitmap!!)
                 }
+            } else {
+                Log.w(TAG, "DAT capturePhoto timed out or returned null; falling back to active frame.")
             }
         }
 
-        // Fallback to active preview or selected mock scene bitmap when running in headless emulator
-        val fallback = _state.value.previewFrame ?: loadSceneBitmap(currentScene)
-        if (fallback != null) {
-            Result.success(fallback.copy(Bitmap.Config.ARGB_8888, false))
+        // Fallback to full-resolution mock scene or active preview frame
+        val fallback = if (snapshot.hardware.usingDeviceCamera) {
+            snapshot.previewFrame
+        } else {
+            loadSceneBitmap(currentScene) ?: snapshot.previewFrame
+        }
+        val safeBitmap = fallback?.let(::ensureSoftwareArgb8888)
+        if (safeBitmap != null) {
+            Result.success(safeBitmap)
         } else {
             Result.failure(IllegalStateException("No active glasses frame available to capture"))
         }
+    }
+
+    private fun ensureSoftwareArgb8888(src: Bitmap): Bitmap? {
+        if (src.isRecycled) return null
+        return runCatching { src.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
     }
 
     override fun release() {
