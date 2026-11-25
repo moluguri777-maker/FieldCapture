@@ -1,5 +1,6 @@
 package com.example.data.local
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
@@ -47,7 +48,7 @@ data class CaptureEvidenceEntity(
     val estimateCodesJson: String,
     val syncStatus: String,
     val createdAtEpochMs: Long,
-    val evidenceSource: String = "UNKNOWN",
+    @ColumnInfo(defaultValue = "UNKNOWN") val evidenceSource: String = "UNKNOWN",
     val imageSha256: String? = null
 )
 

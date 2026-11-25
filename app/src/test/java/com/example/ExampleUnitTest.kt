@@ -13,6 +13,7 @@ import com.example.domain.model.EstimateCodeCatalog
 import com.example.domain.model.EvidenceSource
 import com.example.domain.model.QualityIssue
 import com.example.domain.model.QualityReport
+import com.example.domain.model.SessionLifecycleState
 import com.example.domain.model.SyncStatus
 import com.example.eval.EvalGroundTruthEvaluator
 import com.example.eval.LabeledGroundTruthSample
@@ -21,6 +22,8 @@ import com.example.voice.ParsedVoiceCommand
 import com.example.voice.VoiceCommandParser
 import com.example.voice.VoiceCommandSpec
 import com.example.voice.VoiceParseResult
+import com.example.wearable.DatWearableSessionGateway
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -469,6 +472,71 @@ class ExampleUnitTest {
         assertEquals(1.0f, mfgMetric.accuracy, 0.001f)
         val serialMetric = report.fieldMetrics.first { it.fieldName == "serialNumber" }
         assertEquals(0.5f, serialMetric.accuracy, 0.001f)
+    }
+
+    @Test
+    fun wearableGateway_gatesSdkInitBehindBluetoothPermission_andRecoversFromStartupFailures() = runTest {
+        var permissionGranted = false
+        var bootstrapCalls = 0
+        var shouldThrowSecurity = false
+        var shouldThrowGeneric = false
+
+        val gateway = DatWearableSessionGateway(
+            appContext = null,
+            permissionChecker = { permissionGranted },
+            sdkBootstrap = {
+                bootstrapCalls++
+                if (shouldThrowSecurity) {
+                    throw SecurityException("Need android.permission.BLUETOOTH_CONNECT permission for BluetoothAdapter.getBondedDevices()")
+                }
+                if (shouldThrowGeneric) {
+                    throw IllegalStateException("DAT service unavailable")
+                }
+            },
+            mainDispatcher = Dispatchers.Unconfined,
+            ioDispatcher = Dispatchers.Unconfined
+        )
+
+        // 1. Permission denied -> SDK MUST NOT initialize, no crash, banner flag set
+        assertFalse(gateway.initializeSdkInternal())
+        gateway.pairMockGlasses()
+        gateway.startSession()
+        assertEquals(0, bootstrapCalls)
+        assertTrue(gateway.state.value.requiresBluetoothPermission)
+        assertFalse(gateway.state.value.sdkInitialized)
+        assertEquals(SessionLifecycleState.DISCONNECTED, gateway.state.value.lifecycleState)
+
+        // 2. Permission granted, but SDK throws SecurityException -> graceful ERROR state, no crash
+        permissionGranted = true
+        shouldThrowSecurity = true
+        assertFalse(gateway.initializeSdkInternal())
+        assertEquals(1, bootstrapCalls)
+        assertTrue(gateway.state.value.requiresBluetoothPermission)
+        assertFalse(gateway.state.value.sdkInitialized)
+        assertEquals(SessionLifecycleState.ERROR, gateway.state.value.lifecycleState)
+        assertTrue(gateway.state.value.lastError.orEmpty().contains("BLUETOOTH_CONNECT"))
+
+        // 3. Generic startup failure -> graceful ERROR state without marking SDK initialized
+        shouldThrowSecurity = false
+        shouldThrowGeneric = true
+        assertFalse(gateway.initializeSdkInternal())
+        assertEquals(2, bootstrapCalls)
+        assertFalse(gateway.state.value.requiresBluetoothPermission)
+        assertFalse(gateway.state.value.sdkInitialized)
+        assertEquals(SessionLifecycleState.ERROR, gateway.state.value.lifecycleState)
+
+        // 4. Subsequent retry succeeds cleanly once condition clears
+        shouldThrowGeneric = false
+        assertTrue(gateway.initializeSdkInternal())
+        assertEquals(3, bootstrapCalls)
+        assertFalse(gateway.state.value.requiresBluetoothPermission)
+        assertTrue(gateway.state.value.sdkInitialized)
+        assertEquals(SessionLifecycleState.DISCONNECTED, gateway.state.value.lifecycleState)
+        assertNull(gateway.state.value.lastError)
+
+        // 5. Idempotent after initialization
+        assertTrue(gateway.initializeSdkInternal())
+        assertEquals(3, bootstrapCalls)
     }
 
     private fun analyzeBufferedImage(

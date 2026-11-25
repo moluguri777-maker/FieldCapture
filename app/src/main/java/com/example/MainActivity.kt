@@ -2,10 +2,14 @@
 package com.example
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -15,12 +19,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Assignment
+import androidx.compose.material.icons.automirrored.outlined.Assignment
 import androidx.compose.material.icons.filled.Analytics
-import androidx.compose.material.icons.filled.Assignment
 import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.outlined.Analytics
-import androidx.compose.material.icons.automirrored.outlined.Assignment
 import androidx.compose.material.icons.outlined.CloudSync
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.Badge
@@ -33,10 +37,15 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -56,6 +65,7 @@ import com.example.ui.screens.JobEvidenceScreen
 import com.example.ui.screens.SyncQueueScreen
 import com.example.ui.theme.FieldCaptureTheme
 import com.example.ui.viewmodel.FieldCaptureViewModel
+import com.example.wearable.WearablePermissions
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -109,9 +119,49 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
 
+    val context = LocalContext.current
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDest = backStackEntry?.destination
+
+    var hasRequestedBluetoothAtStartup by rememberSaveable { mutableStateOf(false) }
+
+    val bluetoothPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val allGranted = grants.values.all { it } &&
+            WearablePermissions.hasBluetoothConnectPermission(context)
+        viewModel.onBluetoothPermissionResult(allGranted)
+    }
+
+    val requestBluetoothPermissions: () -> Unit = {
+        val perms = WearablePermissions.requiredBluetoothPermissions()
+        if (perms.isEmpty() || WearablePermissions.hasBluetoothConnectPermission(context)) {
+            viewModel.onBluetoothPermissionResult(true)
+        } else {
+            bluetoothPermissionLauncher.launch(perms)
+        }
+    }
+
+    val openAppSettings: () -> Unit = {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.fromParts("package", context.packageName, null)
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }
+    }
+
+    LaunchedEffect(Unit) {
+        if (WearablePermissions.hasBluetoothConnectPermission(context)) {
+            viewModel.onBluetoothPermissionResult(true)
+        } else {
+            viewModel.onBluetoothPermissionResult(false)
+            if (!hasRequestedBluetoothAtStartup) {
+                hasRequestedBluetoothAtStartup = true
+                bluetoothPermissionLauncher.launch(WearablePermissions.requiredBluetoothPermissions())
+            }
+        }
+    }
 
     val activeJob by viewModel.activeJob.collectAsStateWithLifecycle()
     val wearableState by viewModel.wearableState.collectAsStateWithLifecycle()
@@ -148,7 +198,7 @@ private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
         NavDestinationItem(
             route = JobRoute,
             labelRes = R.string.nav_job,
-            selectedIcon = Icons.Filled.Assignment,
+            selectedIcon = Icons.AutoMirrored.Filled.Assignment,
             unselectedIcon = Icons.AutoMirrored.Outlined.Assignment,
             testTag = "nav_job",
             badgeCount = captures.size
@@ -263,14 +313,28 @@ private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
                                 voiceState = voiceState,
                                 pipelineState = pipelineState,
                                 onToggleTheme = viewModel::toggleDarkFieldTheme,
-                                onPairMock = viewModel::pairMockGlasses,
+                                onRequestBluetoothPermission = requestBluetoothPermissions,
+                                onOpenAppSettings = openAppSettings,
+                                onPairMock = {
+                                    if (WearablePermissions.hasBluetoothConnectPermission(context)) {
+                                        viewModel.pairMockGlasses()
+                                    } else {
+                                        requestBluetoothPermissions()
+                                    }
+                                },
                                 onUnpairMock = viewModel::unpairMockGlasses,
                                 onSetPower = viewModel::setMockPower,
                                 onSetFolded = viewModel::setMockFolded,
                                 onSetDonned = viewModel::setMockDonned,
                                 onSelectScene = viewModel::selectMockScene,
                                 onToggleDeviceCamera = viewModel::toggleDeviceCameraFeed,
-                                onStartSession = viewModel::startSession,
+                                onStartSession = {
+                                    if (WearablePermissions.hasBluetoothConnectPermission(context)) {
+                                        viewModel.startSession()
+                                    } else {
+                                        requestBluetoothPermissions()
+                                    }
+                                },
                                 onPauseSession = viewModel::pauseSession,
                                 onResumeSession = viewModel::resumeSession,
                                 onStopSession = viewModel::stopSession,

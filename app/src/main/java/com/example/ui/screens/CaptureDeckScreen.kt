@@ -111,6 +111,8 @@ fun CaptureDeckScreen(
     voiceState: VoiceUiState,
     pipelineState: CapturePipelineUiState,
     onToggleTheme: () -> Unit,
+    onRequestBluetoothPermission: () -> Unit,
+    onOpenAppSettings: () -> Unit,
     onPairMock: () -> Unit,
     onUnpairMock: () -> Unit,
     onSetPower: (Boolean) -> Unit,
@@ -193,6 +195,13 @@ fun CaptureDeckScreen(
                     )
                 }
             }
+        }
+
+        if (wearableState.requiresBluetoothPermission) {
+            BluetoothPermissionBannerCard(
+                onGrantPermission = onRequestBluetoothPermission,
+                onOpenSettings = onOpenAppSettings
+            )
         }
 
         // Viewfinder HUD Card
@@ -993,6 +1002,66 @@ private fun QualityGateAlertCard(
                         .testTag("quality_override_button")
                 ) {
                     Text(stringResource(R.string.quality_override))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BluetoothPermissionBannerCard(
+    onGrantPermission: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("bluetooth_permission_card"),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.BluetoothDisabled,
+                    contentDescription = "Nearby devices permission required",
+                    tint = MaterialTheme.colorScheme.onErrorContainer
+                )
+                Text(
+                    text = "Nearby Devices (Bluetooth) Permission Required",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
+            Text(
+                text = "Meta Wearables DAT 1.0 and Mock Device Kit require Nearby Devices (BLUETOOTH_CONNECT) permission on Android 12+ before initializing Bluetooth device detection. Field notes, Job review, Sync Queue, and Eval remain usable.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onGrantPermission,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("grant_bluetooth_permission_button")
+                ) {
+                    Text("Grant Permission")
+                }
+                OutlinedButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("open_bluetooth_settings_button")
+                ) {
+                    Text("App Settings")
                 }
             }
         }

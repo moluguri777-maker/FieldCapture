@@ -6,9 +6,14 @@ import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 data class VoiceUiState(
     val isAvailable: Boolean = false,
@@ -23,19 +28,25 @@ class VoiceInputController(
     private val context: Context,
     private val onTranscriptReady: (String) -> Unit
 ) {
-    private val _state = MutableStateFlow(
-        VoiceUiState(
-            isAvailable = SpeechRecognizer.isRecognitionAvailable(context),
-            statusMessage = if (SpeechRecognizer.isRecognitionAvailable(context)) {
-                "Android SpeechRecognizer ready"
-            } else {
-                "Speech service unavailable on emulator — use Quick-Command bar"
-            }
-        )
-    )
+    private val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val _state = MutableStateFlow(VoiceUiState())
     val state: StateFlow<VoiceUiState> = _state.asStateFlow()
 
     private var speechRecognizer: SpeechRecognizer? = null
+
+    init {
+        probeScope.launch {
+            val available = runCatching { SpeechRecognizer.isRecognitionAvailable(context) }.getOrDefault(false)
+            _state.value = _state.value.copy(
+                isAvailable = available,
+                statusMessage = if (available) {
+                    "Android SpeechRecognizer ready"
+                } else {
+                    "Speech service unavailable on emulator — use Quick-Command bar"
+                }
+            )
+        }
+    }
 
     fun startListening() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -137,5 +148,6 @@ class VoiceInputController(
 
     fun release() {
         stopListening()
+        probeScope.cancel()
     }
 }

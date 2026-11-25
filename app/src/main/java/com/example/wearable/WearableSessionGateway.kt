@@ -1,10 +1,14 @@
 package com.example.wearable
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.net.Uri
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.R
 import com.example.domain.model.EvidenceSource
 import com.example.domain.model.MockHardwareSnapshot
@@ -28,6 +32,7 @@ import com.meta.wearable.dat.mockdevice.api.MockDeviceKitConfig
 import com.meta.wearable.dat.mockdevice.api.MockDeviceKitInterface
 import com.meta.wearable.dat.mockdevice.api.MockGlasses
 import com.meta.wearable.dat.mockdevice.api.camera.CameraFacing
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,9 +43,30 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.nio.ByteBuffer
+
+object WearablePermissions {
+    fun requiredBluetoothPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            emptyArray()
+        }
+
+    fun hasBluetoothConnectPermission(context: Context): Boolean =
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            true
+        } else {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+}
 
 enum class MockFeedScene(val label: String, val drawableRes: Int) {
     NAMEPLATE("HVAC Nameplate", R.drawable.img_sample_nameplate_1795506161252),
@@ -54,6 +80,8 @@ data class WearableGatewayState(
     val previewFrame: Bitmap? = null,
     val disconnectsRecovered: Int = 0,
     val reconnectAttempt: Int = 0,
+    val sdkInitialized: Boolean = false,
+    val requiresBluetoothPermission: Boolean = false,
     val statusDetail: String = "Tap 'Pair Mock Glasses' to initialize Meta DAT 1.0 + Mock Device Kit",
     val lastError: String? = null
 )
@@ -66,6 +94,7 @@ data class CapturedFrame(
 interface WearableSessionGateway {
     val state: StateFlow<WearableGatewayState>
     fun initializeSdk()
+    fun onBluetoothPermissionUpdated(granted: Boolean)
     fun pairMockGlasses()
     fun unpairMockGlasses()
     fun setMockPower(on: Boolean)
@@ -89,12 +118,36 @@ private const val TAG = "DatWearableGateway"
  * Isolates Meta Wearables DAT 1.0.1 SDK (Wearables, DeviceSession, Camera, Stream)
  * and MockDeviceKit behind a clean lifecycle and disconnect-recovery state machine.
  */
-class DatWearableSessionGateway(
-    private val context: Context
+class DatWearableSessionGateway internal constructor(
+    private val appContext: Context?,
+    private val permissionChecker: () -> Boolean,
+    private val sdkBootstrap: (Context?) -> Unit,
+    mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : WearableSessionGateway {
 
-    private val appContext = context.applicationContext
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    constructor(context: Context) : this(
+        appContext = context.applicationContext,
+        permissionChecker = { WearablePermissions.hasBluetoothConnectPermission(context.applicationContext) },
+        sdkBootstrap = { ctx ->
+            val targetCtx = requireNotNull(ctx) { "Application context required for DAT SDK" }
+            val kit = MockDeviceKit.getInstance(targetCtx)
+            // MockDeviceKit.enable internally calls Wearables.initialize(targetCtx) once
+            if (!kit.isEnabled) {
+                kit.enable(
+                    MockDeviceKitConfig(
+                        initiallyRegistered = true,
+                        initialPermissionsGranted = true
+                    )
+                )
+            }
+        }
+    )
+
+    private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
+    private val sdkInitMutex = Mutex()
+    @Volatile
+    private var instanceSdkInitialized = false
 
     private val _state = MutableStateFlow(WearableGatewayState())
     override val state: StateFlow<WearableGatewayState> = _state.asStateFlow()
@@ -123,38 +176,135 @@ class DatWearableSessionGateway(
     }
 
     override fun initializeSdk() {
-        val kit = mockDeviceKit ?: MockDeviceKit.getInstance(appContext).also {
-            mockDeviceKit = it
+        if (!permissionChecker()) {
+            markBluetoothPermissionRequired()
+            return
         }
-        synchronized(initLock) {
-            if (!processSdkInitialized) {
-                processSdkInitialized = true
-                // MockDeviceKit.enable internally calls Wearables.initialize(appContext) once
-                if (!kit.isEnabled) {
-                    kit.enable(
-                        MockDeviceKitConfig(
-                            initiallyRegistered = true,
-                            initialPermissionsGranted = true
-                        )
-                    )
-                }
-            }
+        scope.launch {
+            initializeSdkInternal()
+        }
+    }
+
+    override fun onBluetoothPermissionUpdated(granted: Boolean) {
+        if (granted && permissionChecker()) {
+            _state.value = _state.value.copy(
+                requiresBluetoothPermission = false,
+                lastError = null
+            )
+            initializeSdk()
+        } else {
+            markBluetoothPermissionRequired()
+        }
+    }
+
+    private fun markBluetoothPermissionRequired() {
+        _state.value = _state.value.copy(
+            requiresBluetoothPermission = true,
+            sdkInitialized = false,
+            lifecycleState = if (_state.value.lifecycleState == SessionLifecycleState.STREAMING) {
+                _state.value.lifecycleState
+            } else {
+                SessionLifecycleState.DISCONNECTED
+            },
+            statusDetail = "Bluetooth (Nearby devices) permission required before initializing Meta DAT 1.0",
+            lastError = "BLUETOOTH_CONNECT permission not granted — tap Grant Permission to enable Mock Device Kit."
+        )
+    }
+
+    internal suspend fun initializeSdkInternal(): Boolean = sdkInitMutex.withLock {
+        if (!permissionChecker()) {
+            markBluetoothPermissionRequired()
+            return@withLock false
+        }
+        val alreadyReady = if (appContext != null) processSdkInitialized else instanceSdkInitialized
+        if (alreadyReady) {
+            _state.value = _state.value.copy(
+                requiresBluetoothPermission = false,
+                sdkInitialized = true
+            )
+            startRegistrationObserverIfNeeded()
+            return@withLock true
         }
 
-        if (!registrationCollectStarted) {
-            registrationCollectStarted = true
-            scope.launch {
+        return@withLock try {
+            withContext(ioDispatcher) {
+                val targetCtx = appContext
+                if (targetCtx != null) {
+                    synchronized(initLock) {
+                        if (!processSdkInitialized) {
+                            sdkBootstrap(targetCtx)
+                            processSdkInitialized = true
+                        }
+                    }
+                    if (mockDeviceKit == null) {
+                        mockDeviceKit = runCatching { MockDeviceKit.getInstance(targetCtx) }.getOrNull()
+                    }
+                } else {
+                    sdkBootstrap(null)
+                }
+            }
+            instanceSdkInitialized = true
+            _state.value = _state.value.copy(
+                requiresBluetoothPermission = false,
+                sdkInitialized = true,
+                lifecycleState = if (_state.value.lifecycleState == SessionLifecycleState.ERROR) {
+                    SessionLifecycleState.DISCONNECTED
+                } else {
+                    _state.value.lifecycleState
+                },
+                statusDetail = if (_state.value.hardware.paired) {
+                    _state.value.statusDetail
+                } else {
+                    "Meta DAT 1.0 SDK ready — tap 'Pair Mock Glasses' to begin"
+                },
+                lastError = null
+            )
+            startRegistrationObserverIfNeeded()
+            true
+        } catch (se: SecurityException) {
+            runCatching { Log.e(TAG, "Bluetooth permission denied while initializing DAT SDK", se) }
+            _state.value = _state.value.copy(
+                requiresBluetoothPermission = true,
+                sdkInitialized = false,
+                lifecycleState = SessionLifecycleState.ERROR,
+                statusDetail = "Bluetooth permission required for Meta DAT 1.0",
+                lastError = se.localizedMessage ?: "Need android.permission.BLUETOOTH_CONNECT permission"
+            )
+            false
+        } catch (t: Throwable) {
+            runCatching { Log.e(TAG, "DAT SDK initialization failed", t) }
+            _state.value = _state.value.copy(
+                requiresBluetoothPermission = false,
+                sdkInitialized = false,
+                lifecycleState = SessionLifecycleState.ERROR,
+                statusDetail = "Meta DAT SDK initialization failed",
+                lastError = t.localizedMessage ?: t.javaClass.simpleName
+            )
+            false
+        }
+    }
+
+    private fun startRegistrationObserverIfNeeded() {
+        if (appContext == null || registrationCollectStarted) return
+        registrationCollectStarted = true
+        scope.launch {
+            runCatching {
                 Wearables.registrationState.collect { reg ->
                     _state.value = _state.value.copy(
                         hardware = _state.value.hardware.copy(registrationState = reg.name)
                     )
                 }
+            }.onFailure { err ->
+                Log.w(TAG, "Unable to observe Wearables.registrationState", err)
             }
         }
     }
 
     override fun pairMockGlasses() {
-        initializeSdk()
+        if (!permissionChecker()) {
+            markBluetoothPermissionRequired()
+            return
+        }
         scope.launch {
             pairMockGlassesInternal()
         }
@@ -162,40 +312,68 @@ class DatWearableSessionGateway(
 
     override suspend fun ensureMockGlassesPaired(): Boolean {
         if (_state.value.hardware.paired) return true
-        initializeSdk()
+        if (!permissionChecker()) {
+            markBluetoothPermissionRequired()
+            return false
+        }
         return pairMockGlassesInternal()
     }
 
     private suspend fun pairMockGlassesInternal(): Boolean {
-        val kit = mockDeviceKit ?: MockDeviceKit.getInstance(appContext).also {
-            mockDeviceKit = it
+        if (!initializeSdkInternal()) {
+            return false
         }
-        if (!kit.isEnabled) {
-            kit.enable(MockDeviceKitConfig(initiallyRegistered = true, initialPermissionsGranted = true))
+        val targetCtx = appContext ?: return false
+        val kit = withContext(Dispatchers.IO) {
+            mockDeviceKit ?: MockDeviceKit.getInstance(targetCtx).also { mockDeviceKit = it }
         }
 
-        val pairResult = kit.pairGlasses(GlassesModel.RAYBAN_META)
+        val pairResult = try {
+            withContext(Dispatchers.IO) {
+                kit.pairGlasses(GlassesModel.RAYBAN_META)
+            }
+        } catch (se: SecurityException) {
+            Log.e(TAG, "Bluetooth permission denied during pairMockGlasses", se)
+            markBluetoothPermissionRequired()
+            return false
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unexpected error pairing mock glasses", t)
+            _state.value = _state.value.copy(
+                lifecycleState = SessionLifecycleState.ERROR,
+                lastError = "Mock pairing failed: ${t.localizedMessage ?: t.javaClass.simpleName}"
+            )
+            return false
+        }
+
         var pairedOk = false
         pairResult.onSuccess { glasses ->
             mockGlasses = glasses
-            glasses.powerOn()
-            glasses.unfold()
-            glasses.don()
-            glasses.setBatteryLevel(91)
+            withContext(Dispatchers.IO) {
+                glasses.powerOn()
+                glasses.unfold()
+                glasses.don()
+                glasses.setBatteryLevel(91)
+            }
 
             val sceneUri = ensureSceneFileUri(currentScene)
             val videoUri = ensureSceneVideoUri(currentScene)
-            runCatching {
-                glasses.services.camera.setCapturedImage(sceneUri)
-                glasses.services.cameraCapture.setCapturedPhoto(sceneUri)
-                if (videoUri != null) {
-                    glasses.services.camera.setCameraFeed(videoUri)
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    if (sceneUri != null) {
+                        glasses.services.camera.setCapturedImage(sceneUri)
+                        glasses.services.cameraCapture.setCapturedPhoto(sceneUri)
+                    }
+                    if (videoUri != null) {
+                        glasses.services.camera.setCameraFeed(videoUri)
+                    }
                 }
             }
 
             val preview = loadSceneBitmap(currentScene)
             _state.value = _state.value.copy(
                 lifecycleState = SessionLifecycleState.PAIRED_IDLE,
+                sdkInitialized = true,
+                requiresBluetoothPermission = false,
                 hardware = MockHardwareSnapshot(
                     mockEnabled = true,
                     paired = true,
@@ -279,8 +457,10 @@ class DatWearableSessionGateway(
             val videoUri = ensureSceneVideoUri(scene)
             mockGlasses?.let { glasses ->
                 runCatching {
-                    glasses.services.camera.setCapturedImage(uri)
-                    glasses.services.cameraCapture.setCapturedPhoto(uri)
+                    if (uri != null) {
+                        glasses.services.camera.setCapturedImage(uri)
+                        glasses.services.cameraCapture.setCapturedPhoto(uri)
+                    }
                     if (videoUri != null) {
                         glasses.services.camera.setCameraFeed(videoUri)
                     }
@@ -323,7 +503,10 @@ class DatWearableSessionGateway(
     }
 
     override fun startSession() {
-        initializeSdk()
+        if (!permissionChecker()) {
+            markBluetoothPermissionRequired()
+            return
+        }
         shouldBeStreaming = true
         sessionStartJob?.cancel()
         reconnectJob?.cancel()
@@ -336,6 +519,9 @@ class DatWearableSessionGateway(
         )
 
         sessionStartJob = scope.launch {
+            if (!initializeSdkInternal()) {
+                return@launch
+            }
             if (!_state.value.hardware.paired) {
                 val paired = pairMockGlassesInternal()
                 if (!paired) return@launch
@@ -349,7 +535,15 @@ class DatWearableSessionGateway(
                 return@launch
             }
 
-            val sessionResult = Wearables.createSession(AutoDeviceSelector())
+            val sessionResult = try {
+                withContext(Dispatchers.IO) {
+                    Wearables.createSession(AutoDeviceSelector())
+                }
+            } catch (se: SecurityException) {
+                Log.e(TAG, "Bluetooth permission missing during createSession", se)
+                markBluetoothPermissionRequired()
+                return@launch
+            }
             sessionResult.onSuccess { session ->
                 activeSession = session
                 session.start()
@@ -545,13 +739,13 @@ class DatWearableSessionGateway(
                     capturedBitmap = when (photoData) {
                         is PhotoData.Bitmap -> ensureSoftwareArgb8888(photoData.bitmap)
                         is PhotoData.HEIC -> decodeHeicByteBuffer(photoData.data)?.let(::ensureSoftwareArgb8888)
-                        else -> null
                     }
                 }.onFailure { err, _ ->
                     Log.w(TAG, "DAT capturePhoto returned error: ${err.description}")
                 }
-                if (capturedBitmap != null) {
-                    return@withContext Result.success(CapturedFrame(capturedBitmap!!, source))
+                val resolvedBitmap = capturedBitmap
+                if (resolvedBitmap != null) {
+                    return@withContext Result.success(CapturedFrame(resolvedBitmap, source))
                 }
             } else {
                 Log.w(TAG, "DAT capturePhoto timed out or returned null.")
@@ -747,20 +941,24 @@ class DatWearableSessionGateway(
         }.getOrNull()
     }
 
-    private suspend fun ensureSceneFileUri(scene: MockFeedScene): Uri {
+    private suspend fun ensureSceneFileUri(scene: MockFeedScene): Uri? {
         cachedSceneFiles[scene]?.let { return it }
-        return MockSceneMediaGenerator.ensureSceneImageUri(appContext, scene).also {
+        val ctx = appContext ?: return null
+        return MockSceneMediaGenerator.ensureSceneImageUri(ctx, scene).also {
             cachedSceneFiles[scene] = it
         }
     }
 
     private suspend fun ensureSceneVideoUri(scene: MockFeedScene): Uri? {
         cachedSceneVideoFiles[scene]?.let { return it }
-        return MockSceneMediaGenerator.ensureSceneVideoUri(appContext, scene)?.also {
+        val ctx = appContext ?: return null
+        return MockSceneMediaGenerator.ensureSceneVideoUri(ctx, scene)?.also {
             cachedSceneVideoFiles[scene] = it
         }
     }
 
-    private suspend fun loadSceneBitmap(scene: MockFeedScene): Bitmap? =
-        MockSceneMediaGenerator.loadSceneBitmap(appContext, scene)
+    private suspend fun loadSceneBitmap(scene: MockFeedScene): Bitmap? {
+        val ctx = appContext ?: return null
+        return MockSceneMediaGenerator.loadSceneBitmap(ctx, scene)
+    }
 }

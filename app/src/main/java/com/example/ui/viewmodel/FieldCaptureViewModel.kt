@@ -85,7 +85,7 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
     val voiceState: StateFlow<VoiceUiState> = voiceController.state
 
     val isNetworkOnline: StateFlow<Boolean> = repository.observeNetworkOnline()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), repository.isNetworkConnected())
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
 
     private val _pipelineState = MutableStateFlow(CapturePipelineUiState())
     val pipelineState: StateFlow<CapturePipelineUiState> = _pipelineState.asStateFlow()
@@ -131,7 +131,6 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
     private var evalJob: Job? = null
 
     init {
-        wearableGateway.initializeSdk()
         viewModelScope.launch {
             repository.ensureDefaultJob()
         }
@@ -178,6 +177,10 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     // --- Wearable & Mock Device Kit Controls ---
+    fun onBluetoothPermissionResult(granted: Boolean) {
+        wearableGateway.onBluetoothPermissionUpdated(granted)
+    }
+
     fun pairMockGlasses() = wearableGateway.pairMockGlasses()
     fun unpairMockGlasses() = wearableGateway.unpairMockGlasses()
     fun setMockPower(on: Boolean) = wearableGateway.setMockPower(on)
