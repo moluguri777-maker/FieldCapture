@@ -46,7 +46,9 @@ data class CaptureEvidenceEntity(
     val overallConfidence: Float,
     val estimateCodesJson: String,
     val syncStatus: String,
-    val createdAtEpochMs: Long
+    val createdAtEpochMs: Long,
+    val evidenceSource: String = "UNKNOWN",
+    val imageSha256: String? = null
 )
 
 @Entity(

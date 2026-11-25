@@ -6,6 +6,7 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.util.Log
 import com.example.R
+import com.example.domain.model.EvidenceSource
 import com.example.domain.model.MockHardwareSnapshot
 import com.example.domain.model.SessionLifecycleState
 import com.meta.wearable.dat.camera.Camera
@@ -57,6 +58,11 @@ data class WearableGatewayState(
     val lastError: String? = null
 )
 
+data class CapturedFrame(
+    val bitmap: Bitmap,
+    val source: EvidenceSource
+)
+
 interface WearableSessionGateway {
     val state: StateFlow<WearableGatewayState>
     fun initializeSdk()
@@ -73,7 +79,7 @@ interface WearableSessionGateway {
     fun stopSession()
     fun simulateUnexpectedDisconnect()
     suspend fun ensureMockGlassesPaired(): Boolean
-    suspend fun capturePhotoFrame(): Result<Bitmap>
+    suspend fun capturePhotoFrame(): Result<CapturedFrame>
     fun release()
 }
 
@@ -304,6 +310,7 @@ class DatWearableSessionGateway(
                 return
             }
             _state.value = _state.value.copy(
+                previewFrame = null,
                 hardware = _state.value.hardware.copy(
                     cameraSourceLabel = "Device Back Camera (DAT Mock)",
                     usingDeviceCamera = true
@@ -503,21 +510,32 @@ class DatWearableSessionGateway(
         handleUnexpectedDrop("Simulated Bluetooth / hinge drop")
     }
 
-    override suspend fun capturePhotoFrame(): Result<Bitmap> = withContext(Dispatchers.IO) {
+    override suspend fun capturePhotoFrame(): Result<CapturedFrame> = withContext(Dispatchers.IO) {
         val snapshot = _state.value
-        if (snapshot.hardware.paired && (!snapshot.hardware.poweredOn || !snapshot.hardware.unfolded)) {
+        if (!snapshot.hardware.paired) {
+            return@withContext Result.failure(
+                IllegalStateException("Mock glasses are not paired — pair glasses and tap Start before capturing.")
+            )
+        }
+        if (!snapshot.hardware.poweredOn || !snapshot.hardware.unfolded) {
             return@withContext Result.failure(
                 IllegalStateException("Glasses are powered off or folded — power on and unfold to capture.")
             )
         }
-        if (!snapshot.hardware.paired && snapshot.previewFrame == null) {
+        if (snapshot.lifecycleState != SessionLifecycleState.STREAMING) {
             return@withContext Result.failure(
-                IllegalStateException("No camera stream active — pair glasses and tap Start before capturing.")
+                IllegalStateException("Camera stream is ${snapshot.lifecycleState.name}. Tap Start (or Resume) before capturing.")
             )
         }
 
+        val source = if (snapshot.hardware.usingDeviceCamera) {
+            EvidenceSource.ANDROID_REAR_CAMERA_MOCK
+        } else {
+            EvidenceSource.MOCK_DEVICE_KIT_SCENE
+        }
+
         val stream = activeStream
-        if (stream != null && snapshot.lifecycleState == SessionLifecycleState.STREAMING) {
+        if (stream != null) {
             val result = withTimeoutOrNull(4_000L) {
                 runCatching { stream.capturePhoto() }.getOrNull()
             }
@@ -533,14 +551,14 @@ class DatWearableSessionGateway(
                     Log.w(TAG, "DAT capturePhoto returned error: ${err.description}")
                 }
                 if (capturedBitmap != null) {
-                    return@withContext Result.success(capturedBitmap!!)
+                    return@withContext Result.success(CapturedFrame(capturedBitmap!!, source))
                 }
             } else {
-                Log.w(TAG, "DAT capturePhoto timed out or returned null; falling back to active frame.")
+                Log.w(TAG, "DAT capturePhoto timed out or returned null.")
             }
         }
 
-        // Fallback to full-resolution mock scene or active preview frame
+        // Never fall back to bundled drawables when Android Rear Camera feed is active.
         val fallback = if (snapshot.hardware.usingDeviceCamera) {
             snapshot.previewFrame
         } else {
@@ -548,9 +566,14 @@ class DatWearableSessionGateway(
         }
         val safeBitmap = fallback?.let(::ensureSoftwareArgb8888)
         if (safeBitmap != null) {
-            Result.success(safeBitmap)
+            Result.success(CapturedFrame(safeBitmap, source))
         } else {
-            Result.failure(IllegalStateException("No active glasses frame available to capture"))
+            val noFrameMsg = if (snapshot.hardware.usingDeviceCamera) {
+                "No live Android rear camera frame received from DAT stream yet."
+            } else {
+                "No active glasses frame available to capture"
+            }
+            Result.failure(IllegalStateException(noFrameMsg))
         }
     }
 

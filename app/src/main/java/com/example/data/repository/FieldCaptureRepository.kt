@@ -3,6 +3,7 @@ package com.example.data.repository
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -13,6 +14,7 @@ import androidx.work.WorkManager
 import com.example.ai.GEMINI_MODEL_ID
 import com.example.data.local.CaptureEvidenceEntity
 import com.example.data.local.FieldCaptureDatabase
+import com.example.data.local.InspectionDao
 import com.example.data.local.InspectionJobEntity
 import com.example.data.local.SyncOutboxEntity
 import com.example.data.local.TelemetryMetricEntity
@@ -25,16 +27,22 @@ import com.example.domain.model.CaptureJson
 import com.example.domain.model.ConfidenceField
 import com.example.domain.model.EstimateCodeCatalog
 import com.example.domain.model.EstimateLineItem
+import com.example.domain.model.EvidenceSource
 import com.example.domain.model.ExtractedDataBundle
 import com.example.domain.model.JobRecordJson
 import com.example.domain.model.OutboxItemUi
 import com.example.domain.model.QualityReport
 import com.example.domain.model.SessionSummaryJson
+import com.example.domain.model.SyncBatchResult
 import com.example.domain.model.SyncStatus
 import com.example.domain.model.TelemetryRecordUi
 import com.example.domain.model.TelemetrySummaryJson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -45,10 +53,9 @@ import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-
-import com.example.data.local.InspectionDao
 
 class FieldCaptureRepository internal constructor(
     private val appContext: Context?,
@@ -113,6 +120,43 @@ class FieldCaptureRepository internal constructor(
             }
         }
 
+    fun observeNetworkOnline(): Flow<Boolean> {
+        val ctx = appContext ?: return flowOf(false)
+        return callbackFlow {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            fun checkOnline(): Boolean {
+                val net = cm.activeNetwork ?: return false
+                val caps = cm.getNetworkCapabilities(net) ?: return false
+                return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            }
+
+            trySend(checkOnline())
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    trySend(checkOnline())
+                }
+
+                override fun onLost(network: Network) {
+                    trySend(checkOnline())
+                }
+
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    trySend(networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
+                }
+            }
+            val registered = runCatching {
+                cm.registerDefaultNetworkCallback(callback)
+                true
+            }.getOrDefault(false)
+
+            awaitClose {
+                if (registered) {
+                    runCatching { cm.unregisterNetworkCallback(callback) }
+                }
+            }
+        }.distinctUntilChanged()
+    }
+
     suspend fun ensureDefaultJob(): InspectionJobEntity = withContext(Dispatchers.IO) {
         val existing = dao.getJobById("JOB-2026-4082")
         if (existing != null) return@withContext existing
@@ -148,6 +192,60 @@ class FieldCaptureRepository internal constructor(
         }
     }
 
+    fun computeBitmapSha256(bitmap: Bitmap): String {
+        val w = bitmap.width
+        val h = bitmap.height
+        val rowPixels = IntArray(w)
+        val digest = MessageDigest.getInstance("SHA-256")
+        val rowBytes = ByteArray(w * 4)
+        for (y in 0 until h) {
+            bitmap.getPixels(rowPixels, 0, w, 0, y, w, 1)
+            var bi = 0
+            for (px in rowPixels) {
+                rowBytes[bi++] = ((px ushr 24) and 0xFF).toByte()
+                rowBytes[bi++] = ((px ushr 16) and 0xFF).toByte()
+                rowBytes[bi++] = ((px ushr 8) and 0xFF).toByte()
+                rowBytes[bi++] = (px and 0xFF).toByte()
+            }
+            digest.update(rowBytes)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    suspend fun findDuplicateCapture(
+        jobId: String,
+        commandType: CaptureCommandType,
+        transcript: String,
+        room: String?,
+        surface: String?,
+        imageSha256: String?
+    ): CaptureEvidenceEntity? = withContext(Dispatchers.IO) {
+        val existingList = dao.getCapturesForJob(jobId)
+        val cleanTranscript = transcript.trim()
+        existingList.firstOrNull { cap ->
+            if (cap.extractionError != null) return@firstOrNull false
+            if (cap.commandType != commandType.name) return@firstOrNull false
+            when (commandType) {
+                CaptureCommandType.NOTE -> {
+                    cap.rawVoiceTranscript.trim().equals(cleanTranscript, ignoreCase = true)
+                }
+                CaptureCommandType.NAMEPLATE -> {
+                    imageSha256 != null && cap.imageSha256 == imageSha256
+                }
+                CaptureCommandType.DAMAGE -> {
+                    imageSha256 != null &&
+                        cap.imageSha256 == imageSha256 &&
+                        cap.room.orEmpty().equals(room.orEmpty(), ignoreCase = true) &&
+                        cap.surface.orEmpty().equals(surface.orEmpty(), ignoreCase = true)
+                }
+            }
+        }
+    }
+
+    suspend fun getCaptureEntity(captureId: String): CaptureEvidenceEntity? = withContext(Dispatchers.IO) {
+        dao.getCaptureById(captureId)
+    }
+
     suspend fun saveCaptureImage(captureId: String, bitmap: Bitmap): String = withContext(Dispatchers.IO) {
         val ctx = checkNotNull(appContext) { "Context required to save capture image" }
         val dir = File(ctx.filesDir, "captures").apply { mkdirs() }
@@ -166,7 +264,9 @@ class FieldCaptureRepository internal constructor(
         room: String?,
         surface: String?,
         localImagePath: String?,
-        qualityReport: QualityReport
+        qualityReport: QualityReport,
+        evidenceSource: EvidenceSource = EvidenceSource.UNKNOWN,
+        imageSha256: String? = null
     ) = withContext(Dispatchers.IO) {
         val entity = CaptureEvidenceEntity(
             captureId = captureId,
@@ -183,7 +283,9 @@ class FieldCaptureRepository internal constructor(
             overallConfidence = 0f,
             estimateCodesJson = "[]",
             syncStatus = SyncStatus.QUEUED.name,
-            createdAtEpochMs = System.currentTimeMillis()
+            createdAtEpochMs = System.currentTimeMillis(),
+            evidenceSource = evidenceSource.name,
+            imageSha256 = imageSha256
         )
         dao.upsertCapture(entity)
         dao.updateJobSyncState(
@@ -191,6 +293,7 @@ class FieldCaptureRepository internal constructor(
             syncStatus = SyncStatus.QUEUED.name,
             updatedAtEpochMs = System.currentTimeMillis()
         )
+        enqueueCaptureSync(jobId, captureId)
     }
 
     suspend fun updateCaptureWithExtraction(
@@ -325,22 +428,27 @@ class FieldCaptureRepository internal constructor(
     suspend fun enqueueCaptureSync(jobId: String, captureId: String) = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         val capture = dao.getCaptureById(captureId)
-        if (capture?.localImagePath != null) {
-            dao.upsertOutboxItem(
-                SyncOutboxEntity(
-                    outboxId = "MEDIA-$captureId",
-                    jobId = jobId,
-                    captureId = captureId,
-                    operationType = "UPLOAD_MEDIA",
-                    idempotencyKey = UUID.randomUUID().toString(),
-                    payloadJson = """{"captureId":"$captureId","file":"${File(capture.localImagePath).name}"}""",
-                    attemptCount = 0,
-                    lastHttpError = null,
-                    status = SyncStatus.QUEUED.name,
-                    createdAtEpochMs = now,
-                    updatedAtEpochMs = now
+        if (capture?.localImagePath != null && capture.remoteMediaUrl == null) {
+            val mediaOutboxId = "MEDIA-$captureId"
+            val existingMedia = dao.getOutboxItemById(mediaOutboxId)
+            if (existingMedia?.status != SyncStatus.SYNCED.name) {
+                val payload = """{"captureId":"$captureId","file":"${File(capture.localImagePath).name}"}"""
+                dao.upsertOutboxItem(
+                    SyncOutboxEntity(
+                        outboxId = mediaOutboxId,
+                        jobId = jobId,
+                        captureId = captureId,
+                        operationType = "UPLOAD_MEDIA",
+                        idempotencyKey = existingMedia?.idempotencyKey ?: UUID.randomUUID().toString(),
+                        payloadJson = payload,
+                        attemptCount = existingMedia?.attemptCount ?: 0,
+                        lastHttpError = existingMedia?.lastHttpError,
+                        status = SyncStatus.QUEUED.name,
+                        createdAtEpochMs = existingMedia?.createdAtEpochMs ?: now,
+                        updatedAtEpochMs = now
+                    )
                 )
-            )
+            }
         }
         enqueueJobRecordSync(jobId)
         scheduleAutoSyncWorker()
@@ -349,18 +457,24 @@ class FieldCaptureRepository internal constructor(
     suspend fun enqueueJobRecordSync(jobId: String) = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         val jobJson = buildStructuredJobJsonString(jobId)
+        val outboxId = "JOBSYNC-$jobId"
+        val existing = dao.getOutboxItemById(outboxId)
+        val reusable = existing?.takeIf {
+            it.status == SyncStatus.QUEUED.name || it.status == SyncStatus.FAILED.name
+        }
+
         dao.upsertOutboxItem(
             SyncOutboxEntity(
-                outboxId = "JOBSYNC-$jobId",
+                outboxId = outboxId,
                 jobId = jobId,
                 captureId = null,
                 operationType = "SYNC_JOB",
-                idempotencyKey = UUID.randomUUID().toString(),
+                idempotencyKey = reusable?.idempotencyKey ?: UUID.randomUUID().toString(),
                 payloadJson = jobJson,
-                attemptCount = 0,
-                lastHttpError = null,
+                attemptCount = reusable?.attemptCount ?: 0,
+                lastHttpError = reusable?.lastHttpError,
                 status = SyncStatus.QUEUED.name,
-                createdAtEpochMs = now,
+                createdAtEpochMs = existing?.createdAtEpochMs ?: now,
                 updatedAtEpochMs = now
             )
         )
@@ -392,12 +506,14 @@ class FieldCaptureRepository internal constructor(
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    suspend fun processPendingOutbox(): Int = withContext(Dispatchers.IO) {
+    suspend fun processPendingOutbox(): SyncBatchResult = withContext(Dispatchers.IO) {
         val pending = dao.getPendingOutboxItems()
-        if (pending.isEmpty()) return@withContext 0
+        if (pending.isEmpty()) return@withContext SyncBatchResult(syncedCount = 0, failedCount = 0)
 
         val api = RestApiFactory.create(transportConfig)
         var syncedCount = 0
+        var failedCount = 0
+        val failedCaptureIds = mutableSetOf<String>()
 
         // Upload media before job JSON sync
         val ordered = pending.sortedBy { if (it.operationType == "UPLOAD_MEDIA") 0 else 1 }
@@ -440,15 +556,20 @@ class FieldCaptureRepository internal constructor(
                         idempotencyKey = item.idempotencyKey,
                         jobRecordJson = body
                     )
+                    val jobSyncStatus = if (failedCaptureIds.isEmpty()) SyncStatus.SYNCED.name else SyncStatus.QUEUED.name
                     dao.updateJobSynced(
                         jobId = item.jobId,
                         serverRevision = resp.serverRevision,
-                        syncStatus = SyncStatus.SYNCED.name,
+                        syncStatus = jobSyncStatus,
                         updatedAtEpochMs = System.currentTimeMillis()
                     )
                     dao.getCapturesForJob(item.jobId).forEach { cap ->
-                        if (cap.syncStatus != SyncStatus.SYNCED.name) {
+                        val hasFailedMedia = cap.captureId in failedCaptureIds
+                        val mediaReady = cap.localImagePath == null || cap.remoteMediaUrl != null || !File(cap.localImagePath).exists()
+                        if (!hasFailedMedia && mediaReady && cap.syncStatus != SyncStatus.SYNCED.name) {
                             dao.upsertCapture(cap.copy(syncStatus = SyncStatus.SYNCED.name))
+                        } else if (hasFailedMedia && cap.syncStatus != SyncStatus.FAILED.name) {
+                            dao.upsertCapture(cap.copy(syncStatus = SyncStatus.FAILED.name))
                         }
                     }
                 }
@@ -481,6 +602,13 @@ class FieldCaptureRepository internal constructor(
                 }
                 syncedCount++
             } catch (e: Exception) {
+                failedCount++
+                item.captureId?.let { cid ->
+                    failedCaptureIds += cid
+                    dao.getCaptureById(cid)?.let { cap ->
+                        dao.upsertCapture(cap.copy(syncStatus = SyncStatus.FAILED.name))
+                    }
+                }
                 dao.upsertOutboxItem(
                     item.copy(
                         status = SyncStatus.FAILED.name,
@@ -491,7 +619,7 @@ class FieldCaptureRepository internal constructor(
                 )
             }
         }
-        syncedCount
+        SyncBatchResult(syncedCount = syncedCount, failedCount = failedCount)
     }
 
     suspend fun clearSyncedOutbox() = withContext(Dispatchers.IO) {
@@ -511,6 +639,8 @@ class FieldCaptureRepository internal constructor(
             }
             val codes = runCatching { json.decodeFromString<List<String>>(cap.estimateCodesJson) }
                 .getOrDefault(emptyList())
+            val sourceEnum = runCatching { EvidenceSource.valueOf(cap.evidenceSource) }
+                .getOrDefault(EvidenceSource.UNKNOWN)
             CaptureJson(
                 captureId = cap.captureId,
                 commandType = runCatching { CaptureCommandType.valueOf(cap.commandType) }
@@ -519,6 +649,8 @@ class FieldCaptureRepository internal constructor(
                 rawVoiceTranscript = cap.rawVoiceTranscript,
                 room = cap.room,
                 surface = cap.surface,
+                evidenceSource = sourceEnum.name,
+                isMockOrSample = sourceEnum.isMockOrSample,
                 remoteMediaUrl = cap.remoteMediaUrl,
                 qualityCheck = quality,
                 extractedFields = bundle?.fields ?: emptyMap(),
@@ -593,6 +725,8 @@ class FieldCaptureRepository internal constructor(
         }
         val codes = runCatching { json.decodeFromString<List<String>>(estimateCodesJson) }
             .getOrDefault(emptyList())
+        val sourceEnum = runCatching { EvidenceSource.valueOf(evidenceSource) }
+            .getOrDefault(EvidenceSource.UNKNOWN)
         return CaptureEvidenceUi(
             captureId = captureId,
             jobId = jobId,
@@ -607,7 +741,9 @@ class FieldCaptureRepository internal constructor(
             extractionError = extractionError,
             estimateCodes = codes,
             syncStatus = runCatching { SyncStatus.valueOf(syncStatus) }.getOrDefault(SyncStatus.QUEUED),
-            createdAtEpochMs = createdAtEpochMs
+            createdAtEpochMs = createdAtEpochMs,
+            evidenceSource = sourceEnum,
+            imageSha256 = imageSha256
         )
     }
 }

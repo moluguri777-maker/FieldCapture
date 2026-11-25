@@ -1,5 +1,6 @@
 package com.example.ai
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import com.example.domain.model.CaptureCommandType
@@ -41,7 +42,9 @@ data class AiExtractionOutcome(
     val modelId: String = GEMINI_MODEL_ID
 )
 
-class GeminiExtractionService {
+class GeminiExtractionService(
+    private val appContext: Context? = null
+) {
 
     private fun confidenceFieldSchema(fieldDescription: String): Schema = Schema.obj(
         properties = mapOf(
@@ -148,8 +151,20 @@ class GeminiExtractionService {
         surfaceHint: String?
     ): Result<AiExtractionOutcome> = withContext(Dispatchers.IO) {
         val startNs = System.nanoTime()
+        var scaledBitmap: Bitmap? = null
         try {
-            val scaledBitmap = bitmap?.let { downscaleForInference(it, maxEdge = 1024) }
+            // Pre-validate Firebase App Check token before calling Firebase AI Logic so dummy error
+            // tokens produce an actionable diagnostic and never masquerade as 0% extractions.
+            if (appContext != null) {
+                val appCheckCheck = AppCheckCoordinator.awaitValidAppCheckToken(appContext, forceRefresh = false)
+                if (appCheckCheck.isFailure) {
+                    val err = appCheckCheck.exceptionOrNull()
+                        ?: IllegalStateException("Firebase App Check token validation failed.")
+                    return@withContext Result.failure(err)
+                }
+            }
+
+            scaledBitmap = bitmap?.let { downscaleForInference(it, maxEdge = 1024) }
             val promptText = buildPrompt(commandType, transcript, roomHint, surfaceHint)
             val model = when (commandType) {
                 CaptureCommandType.NAMEPLATE -> nameplateModel
@@ -157,19 +172,30 @@ class GeminiExtractionService {
                 CaptureCommandType.NOTE -> noteModel
             }
 
-            val response = withTimeout(60_000L) {
-                model.generateContent(
-                    content {
-                        if (scaledBitmap != null) {
-                            image(scaledBitmap)
-                        }
-                        text(promptText)
-                    }
-                )
+            val inputContent = content {
+                if (scaledBitmap != null) {
+                    image(scaledBitmap)
+                }
+                text(promptText)
             }
 
-            if (scaledBitmap != null && scaledBitmap !== bitmap) {
-                scaledBitmap.recycle()
+            val response = try {
+                withTimeout(60_000L) { model.generateContent(inputContent) }
+            } catch (e: Exception) {
+                val msg = e.localizedMessage.orEmpty()
+                val looksLikeAppCheckError = msg.contains("App Check", ignoreCase = true) ||
+                    msg.contains("AppCheck", ignoreCase = true) ||
+                    msg.contains("403", ignoreCase = true)
+                if (looksLikeAppCheckError && appContext != null) {
+                    Log.w(TAG, "Retrying Firebase AI Logic request after forced App Check token refresh.")
+                    val refreshed = AppCheckCoordinator.awaitValidAppCheckToken(appContext, forceRefresh = true)
+                    if (refreshed.isFailure) {
+                        throw refreshed.exceptionOrNull() ?: e
+                    }
+                    withTimeout(60_000L) { model.generateContent(inputContent) }
+                } else {
+                    throw e
+                }
             }
 
             val rawJson = response.text
@@ -199,6 +225,10 @@ class GeminiExtractionService {
         } catch (e: Exception) {
             Log.e(TAG, "Gemini extraction failed", e)
             Result.failure(e)
+        } finally {
+            if (scaledBitmap != null && scaledBitmap !== bitmap && !scaledBitmap.isRecycled) {
+                scaledBitmap.recycle()
+            }
         }
     }
 
@@ -262,8 +292,11 @@ class GeminiExtractionService {
             val obj = (json[key] as? JsonObject)
                 ?: if (key == "manufactureDate") (json["manufactureYear"] as? JsonObject) else null
             if (obj != null) {
-                val valStr = obj["value"]?.jsonPrimitive?.contentOrNull?.ifBlank { "Unknown" } ?: "Unknown"
-                val conf = (obj["confidence"]?.jsonPrimitive?.doubleOrNull ?: 0.5).toFloat().coerceIn(0f, 1f)
+                val valStr = obj["value"]?.jsonPrimitive?.contentOrNull?.trim()?.ifBlank { "Unknown" } ?: "Unknown"
+                val rawConf = obj["confidence"]?.jsonPrimitive?.doubleOrNull
+                val conf = (rawConf ?: if (valStr.equals("Unknown", ignoreCase = true)) 0.25 else 0.5)
+                    .toFloat()
+                    .coerceIn(0f, 1f)
                 fieldMap[key] = ConfidenceField(
                     value = valStr,
                     confidence = conf,
@@ -303,6 +336,11 @@ class GeminiExtractionService {
             fieldMap.values.map { it.confidence }.average().toFloat()
         } else {
             0f
+        }
+
+        // Never treat 0% confidence as a valid extraction.
+        if (meanConf <= 0f) {
+            throw IllegalStateException("Extraction returned 0% mean confidence and cannot be accepted as valid evidence.")
         }
 
         return ExtractedDataBundle(

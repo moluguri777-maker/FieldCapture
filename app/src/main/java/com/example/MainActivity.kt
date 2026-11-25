@@ -1,6 +1,7 @@
 
 package com.example
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -97,6 +98,12 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        configureAppCheck(this, intent)
+    }
 }
 
 @Composable
@@ -117,6 +124,7 @@ private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
     val loopbackMode by viewModel.loopbackMode.collectAsStateWithLifecycle()
     val baseUrl by viewModel.baseUrl.collectAsStateWithLifecycle()
     val isSyncingNow by viewModel.isSyncingNow.collectAsStateWithLifecycle()
+    val isNetworkOnline by viewModel.isNetworkOnline.collectAsStateWithLifecycle()
     val exportedJobJson by viewModel.exportedJobJson.collectAsStateWithLifecycle()
     val evalSummary by viewModel.evalSummary.collectAsStateWithLifecycle()
     val telemetryRecords by viewModel.telemetryRecords.collectAsStateWithLifecycle()
@@ -283,6 +291,7 @@ private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
                                 exportedJson = exportedJobJson,
                                 onUpdateField = viewModel::updateFieldValue,
                                 onToggleEstimateCode = viewModel::toggleEstimateCode,
+                                onRetryExtraction = viewModel::retryExtraction,
                                 onDeleteCapture = viewModel::deleteCapture,
                                 onExportJobJson = viewModel::refreshJobJsonExport,
                                 onDismissExportJson = viewModel::dismissJobJsonExport
@@ -295,7 +304,7 @@ private fun FieldCaptureAppShell(viewModel: FieldCaptureViewModel) {
                                 httpTraces = httpTraces,
                                 loopbackMode = loopbackMode,
                                 baseUrl = baseUrl,
-                                isNetworkOnline = viewModel.isNetworkConnected(),
+                                isNetworkOnline = isNetworkOnline,
                                 isSyncingNow = isSyncingNow,
                                 onToggleLoopback = viewModel::setLoopbackMode,
                                 onUpdateBaseUrl = viewModel::updateRestBaseUrl,

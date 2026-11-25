@@ -135,6 +135,20 @@ data class MockHardwareSnapshot(
     val streamStateLabel: String = "STOPPED"
 )
 
+enum class EvidenceSource(val displayLabel: String, val isMockOrSample: Boolean) {
+    MOCK_DEVICE_KIT_SCENE("Mock Device Kit Sample Scene", true),
+    ANDROID_REAR_CAMERA_MOCK("Android Rear Camera (DAT Mock Bridge)", false),
+    META_DAT_GLASSES_CAMERA("Meta AI Glasses Camera (DAT 1.0)", false),
+    PHOTO_PICKER_IMPORT("Photo Picker Import", false),
+    VOICE_NOTE_ONLY("Voice Note (No Image)", false),
+    UNKNOWN("Unverified Source", true)
+}
+
+data class SyncBatchResult(
+    val syncedCount: Int,
+    val failedCount: Int
+)
+
 data class CaptureEvidenceUi(
     val captureId: String,
     val jobId: String,
@@ -149,7 +163,9 @@ data class CaptureEvidenceUi(
     val extractionError: String?,
     val estimateCodes: List<String>,
     val syncStatus: SyncStatus,
-    val createdAtEpochMs: Long
+    val createdAtEpochMs: Long,
+    val evidenceSource: EvidenceSource = EvidenceSource.UNKNOWN,
+    val imageSha256: String? = null
 )
 
 data class OutboxItemUi(
@@ -195,6 +211,7 @@ data class EvalFrameResultUi(
     val frameLabel: String,
     val sourceKind: String,
     val commandType: CaptureCommandType,
+    val isLowLightCase: Boolean = false,
     val qualityPassed: Boolean,
     val blurScore: Double,
     val brightnessScore: Double,
@@ -203,21 +220,42 @@ data class EvalFrameResultUi(
     val aiSucceeded: Boolean,
     val meanConfidence: Float,
     val matchedCodes: List<String>,
+    val extractedFieldConfidences: Map<String, Float> = emptyMap(),
     val qualityLatencyMs: Long,
     val aiLatencyMs: Long,
     val promptTokens: Int,
     val outputTokens: Int,
     val estimatedCostUsd: Double,
-    val notes: String
+    val notes: String,
+    val likelyFailureCause: String? = null
+)
+
+data class EvalFailureCaseUi(
+    val frameIndex: Int,
+    val frameLabel: String,
+    val commandType: CaptureCommandType,
+    val summary: String,
+    val likelyCause: String
 )
 
 data class EvalBatchSummaryUi(
     val totalFrames: Int = 0,
     val completedFrames: Int = 0,
     val isRunning: Boolean = false,
+    val realFrameCount: Int = 0,
+    val syntheticFrameCount: Int = 0,
+    val nameplateCount: Int = 0,
+    val lowLightCount: Int = 0,
     val qualityPassCount: Int = 0,
+    val blurRejectedCount: Int = 0,
+    val darkRejectedCount: Int = 0,
+    val overexposedRejectedCount: Int = 0,
+    val framingRejectedCount: Int = 0,
     val aiSuccessCount: Int = 0,
+    val aiFailureCount: Int = 0,
     val meanConfidence: Float = 0f,
+    val perFieldMeanConfidence: Map<String, Float> = emptyMap(),
+    val worstFailures: List<EvalFailureCaseUi> = emptyList(),
     val p50TotalLatencyMs: Long = 0L,
     val p95TotalLatencyMs: Long = 0L,
     val totalTokens: Int = 0,
@@ -256,6 +294,8 @@ data class CaptureJson(
     val rawVoiceTranscript: String,
     val room: String?,
     val surface: String?,
+    val evidenceSource: String = EvidenceSource.UNKNOWN.name,
+    val isMockOrSample: Boolean = true,
     val remoteMediaUrl: String?,
     val qualityCheck: QualityReport,
     val extractedFields: Map<String, ConfidenceField>,

@@ -6,10 +6,35 @@ import com.example.domain.model.QualityIssue
 import com.example.domain.model.QualityReport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+
+/**
+ * Calibrated thresholds for on-device frame quality gates at 320px normalized width:
+ * - Blur uses 4-neighbor Laplacian variance; HVAC/electrical nameplates require sharper
+ *   micro-typography (95.0) than wider structural damage frames (65.0).
+ * - Darkness uses BT.601 luminance: mean < 45.0 or >65% of pixels below luma 28.0 indicates
+ *   severe underexposure where nameplate/mold detail drops into sensor noise.
+ * - Overexposure flags washed-out glare frames (mean > 230.0 or >45% clipped above luma 242.0).
+ * - Framing compares Sobel edge density inside the central 72% reticle ROI against the outer
+ *   14% border with an 0.85 border weight to catch off-center or blank-center shots.
+ */
+object QualityThresholds {
+    const val NORMALIZED_MAX_WIDTH = 320
+    const val BLUR_VARIANCE_NAMEPLATE = 95.0
+    const val BLUR_VARIANCE_GENERAL = 65.0
+    const val LUMA_MIN_MEAN = 45.0
+    const val LUMA_DARK_PIXEL_CUTOFF = 28.0
+    const val DARK_PIXEL_MAX_RATIO = 0.65
+    const val LUMA_MAX_MEAN = 230.0
+    const val LUMA_CLIPPED_PIXEL_CUTOFF = 242.0
+    const val CLIPPED_PIXEL_MAX_RATIO = 0.45
+    const val FRAMING_MIN_SCORE = 0.36
+    const val CENTER_ROI_INSET_RATIO = 0.14
+    const val CENTER_EDGE_WEAK_MAX = 8.0
+    const val BORDER_EDGE_DOMINANCE_MIN = 18.0
+}
 
 /**
  * Pure on-device computer vision image quality gate for field inspection frames.
@@ -25,7 +50,7 @@ class ImageQualityAnalyzer {
         val startNs = System.nanoTime()
 
         // Downsample deterministically to max 320px width for fast, consistent scoring
-        val targetW = min(320, max(64, bitmap.width))
+        val targetW = min(QualityThresholds.NORMALIZED_MAX_WIDTH, max(64, bitmap.width))
         val targetH = max(64, (bitmap.height * (targetW.toFloat() / max(1, bitmap.width))).toInt())
         val scaled = if (bitmap.width != targetW || bitmap.height != targetH) {
             Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
@@ -65,8 +90,8 @@ class ImageQualityAnalyzer {
             val y = 0.299 * r + 0.587 * g + 0.114 * b
             luma[i] = y
             sumLuma += y
-            if (y < 28.0) darkCount++
-            if (y > 242.0) clippedCount++
+            if (y < QualityThresholds.LUMA_DARK_PIXEL_CUTOFF) darkCount++
+            if (y > QualityThresholds.LUMA_CLIPPED_PIXEL_CUTOFF) clippedCount++
         }
 
         val n = pixels.size.toDouble()
@@ -85,10 +110,11 @@ class ImageQualityAnalyzer {
         var borderEdgeSum = 0.0
         var borderCount = 0
 
-        val xMinCenter = (w * 0.14).toInt()
-        val xMaxCenter = (w * 0.86).toInt()
-        val yMinCenter = (h * 0.14).toInt()
-        val yMaxCenter = (h * 0.86).toInt()
+        val inset = QualityThresholds.CENTER_ROI_INSET_RATIO
+        val xMinCenter = (w * inset).toInt()
+        val xMaxCenter = (w * (1.0 - inset)).toInt()
+        val yMinCenter = (h * inset).toInt()
+        val yMaxCenter = (h * (1.0 - inset)).toInt()
 
         for (y in 1 until h - 1) {
             val row = y * w
@@ -135,20 +161,22 @@ class ImageQualityAnalyzer {
         }
 
         val blurThreshold = when (commandType) {
-            CaptureCommandType.NAMEPLATE -> 95.0 // Nameplates need crisper OCR detail
-            CaptureCommandType.DAMAGE, CaptureCommandType.NOTE -> 65.0
+            CaptureCommandType.NAMEPLATE -> QualityThresholds.BLUR_VARIANCE_NAMEPLATE
+            CaptureCommandType.DAMAGE, CaptureCommandType.NOTE -> QualityThresholds.BLUR_VARIANCE_GENERAL
         }
 
         val issues = mutableListOf<QualityIssue>()
         if (lapVariance < blurThreshold) {
             issues += QualityIssue.BLURRY
         }
-        if (meanLuma < 45.0 || darkRatio > 0.65) {
+        if (meanLuma < QualityThresholds.LUMA_MIN_MEAN || darkRatio > QualityThresholds.DARK_PIXEL_MAX_RATIO) {
             issues += QualityIssue.TOO_DARK
-        } else if (meanLuma > 230.0 || clippedRatio > 0.45) {
+        } else if (meanLuma > QualityThresholds.LUMA_MAX_MEAN || clippedRatio > QualityThresholds.CLIPPED_PIXEL_MAX_RATIO) {
             issues += QualityIssue.OVEREXPOSED
         }
-        if (framingScore < 0.36 || (centerMeanEdge < 8.0 && borderMeanEdge > 18.0)) {
+        if (framingScore < QualityThresholds.FRAMING_MIN_SCORE ||
+            (centerMeanEdge < QualityThresholds.CENTER_EDGE_WEAK_MAX && borderMeanEdge > QualityThresholds.BORDER_EDGE_DOMINANCE_MIN)
+        ) {
             issues += QualityIssue.POOR_FRAMING
         }
 
@@ -158,7 +186,7 @@ class ImageQualityAnalyzer {
             val reasons = issues.joinToString(", ") { issue ->
                 when (issue) {
                     QualityIssue.BLURRY -> "Blur (${lapVariance.toInt()} < ${blurThreshold.toInt()})"
-                    QualityIssue.TOO_DARK -> "Dark (Luma ${meanLuma.toInt()} < 45)"
+                    QualityIssue.TOO_DARK -> "Dark (Luma ${meanLuma.toInt()} < ${QualityThresholds.LUMA_MIN_MEAN.toInt()})"
                     QualityIssue.OVEREXPOSED -> "Overexposed (Luma ${meanLuma.toInt()})"
                     QualityIssue.POOR_FRAMING -> "Subject off-center (${(framingScore * 100).toInt()}%)"
                 }

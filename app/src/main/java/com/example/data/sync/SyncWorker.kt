@@ -13,8 +13,12 @@ class SyncWorker(
     override suspend fun doWork(): Result {
         val repo = FieldCaptureRepository(applicationContext)
         return try {
-            repo.processPendingOutbox()
-            Result.success()
+            val outcome = repo.processPendingOutbox()
+            if (outcome.failedCount > 0) {
+                if (runAttemptCount < 4) Result.retry() else Result.failure()
+            } else {
+                Result.success()
+            }
         } catch (e: Exception) {
             if (runAttemptCount < 4) Result.retry() else Result.failure()
         }

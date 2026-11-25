@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ReceiptLong
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
@@ -82,6 +83,7 @@ fun JobEvidenceScreen(
     exportedJson: String?,
     onUpdateField: (captureId: String, fieldKey: String, newValue: String) -> Unit,
     onToggleEstimateCode: (captureId: String, code: String) -> Unit,
+    onRetryExtraction: (captureId: String) -> Unit,
     onDeleteCapture: (captureId: String) -> Unit,
     onExportJobJson: () -> Unit,
     onDismissExportJson: () -> Unit,
@@ -240,6 +242,7 @@ fun JobEvidenceScreen(
                 capture = cap,
                 onEditField = { key, oldVal -> editingTarget = Triple(cap.captureId, key, oldVal) },
                 onOpenCodePicker = { codePickerCaptureId = cap.captureId },
+                onRetryExtraction = { onRetryExtraction(cap.captureId) },
                 onDelete = { onDeleteCapture(cap.captureId) }
             )
         }
@@ -340,6 +343,7 @@ private fun CaptureEvidenceCard(
     capture: CaptureEvidenceUi,
     onEditField: (String, String) -> Unit,
     onOpenCodePicker: () -> Unit,
+    onRetryExtraction: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -355,12 +359,34 @@ private fun CaptureEvidenceCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "${capture.commandType.name} • ${capture.captureId}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = ElectricCyan
-                    )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "${capture.commandType.name} • ${capture.captureId}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = ElectricCyan
+                        )
+                        Surface(
+                            color = if (capture.evidenceSource.isMockOrSample) {
+                                StatusAmber.copy(alpha = 0.16f)
+                            } else {
+                                StatusEmerald.copy(alpha = 0.16f)
+                            },
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = capture.evidenceSource.displayLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (capture.evidenceSource.isMockOrSample) StatusAmber else StatusEmerald,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                     Text(
                         text = "\"${capture.rawVoiceTranscript}\"",
                         style = MaterialTheme.typography.titleMedium,
@@ -408,28 +434,60 @@ private fun CaptureEvidenceCard(
                         style = MaterialTheme.typography.labelSmall,
                         color = if (capture.qualityReport.passed) StatusEmerald else StatusAmber
                     )
+                    val statusLine = when {
+                        capture.extraction != null ->
+                            "Mean Confidence: ${(capture.extraction.overallConfidence * 100).toInt()}% • Sync: ${capture.syncStatus.name}"
+                        capture.extractionError != null ->
+                            "AI Extraction Failed • Confidence N/A • Sync: ${capture.syncStatus.name}"
+                        else ->
+                            "AI Extraction Pending • Sync: ${capture.syncStatus.name}"
+                    }
                     Text(
-                        text = "Mean Confidence: ${(capture.extraction?.overallConfidence?.times(100)?.toInt() ?: 0)}% • Sync: ${capture.syncStatus.name}",
+                        text = statusLine,
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (capture.extractionError != null) StatusCrimson else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
 
-            // Per-field Extracted Values with Confidence Badges
-            capture.extractionError?.let { err ->
+            // Per-field Extracted Values with Confidence Badges or Actionable Retry Banner
+            if (capture.extractionError != null || capture.extraction == null) {
                 Surface(
                     color = MaterialTheme.colorScheme.errorContainer,
-                    shape = RoundedCornerShape(8.dp),
+                    shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.size(16.dp))
-                        Text(err, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+                        Row(
+                            verticalAlignment = Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = capture.extractionError ?: "Waiting for AI extraction.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onRetryExtraction,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("retry_extraction_${capture.captureId}")
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Retry AI Extraction (Keep Saved Photo)")
+                        }
                     }
                 }
             }

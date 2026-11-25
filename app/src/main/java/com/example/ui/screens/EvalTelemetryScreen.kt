@@ -247,10 +247,52 @@ fun EvalTelemetryScreen(
                             modifier = Modifier.fillMaxWidth()
                         )
                         Text(
-                            text = "Processed ${evalSummary.completedFrames}/${evalSummary.totalFrames} • CV Pass: ${evalSummary.qualityPassCount} • AI Done: ${evalSummary.aiSuccessCount} • P50 ${evalSummary.p50TotalLatencyMs}ms / P95 ${evalSummary.p95TotalLatencyMs}ms",
+                            text = "Processed ${evalSummary.completedFrames}/${evalSummary.totalFrames} • Real: ${evalSummary.realFrameCount} • Synthetic: ${evalSummary.syntheticFrameCount} • Nameplates: ${evalSummary.nameplateCount} • Low-Light: ${evalSummary.lowLightCount}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ElectricCyan
                         )
+                        Text(
+                            text = "CV Pass: ${evalSummary.qualityPassCount} (Blur ${evalSummary.blurRejectedCount}, Dark ${evalSummary.darkRejectedCount}, Glare ${evalSummary.overexposedRejectedCount}, Framing ${evalSummary.framingRejectedCount}) • AI OK: ${evalSummary.aiSuccessCount}, Fail: ${evalSummary.aiFailureCount} • P50 ${evalSummary.p50TotalLatencyMs}ms / P95 ${evalSummary.p95TotalLatencyMs}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (evalSummary.perFieldMeanConfidence.isNotEmpty()) {
+                            Text(
+                                text = "Field Confidence: " + evalSummary.perFieldMeanConfidence.entries.joinToString(", ") {
+                                    "${it.key}: ${(it.value * 100).toInt()}%"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = StatusEmerald
+                            )
+                        }
+                        if (evalSummary.worstFailures.isNotEmpty()) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Text(
+                                        text = "Top ${evalSummary.worstFailures.size} Failure Cases",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    evalSummary.worstFailures.forEach { f ->
+                                        Text(
+                                            text = "#${f.frameIndex} ${f.frameLabel}: ${f.likelyCause}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     Row(

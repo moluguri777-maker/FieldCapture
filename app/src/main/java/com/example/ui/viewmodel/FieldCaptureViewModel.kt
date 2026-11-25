@@ -2,6 +2,7 @@ package com.example.ui.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -14,9 +15,11 @@ import com.example.domain.model.CaptureCommandType
 import com.example.domain.model.CaptureEvidenceUi
 import com.example.domain.model.EstimateLineItem
 import com.example.domain.model.EvalBatchSummaryUi
+import com.example.domain.model.EvidenceSource
 import com.example.domain.model.HttpTraceLog
 import com.example.domain.model.OutboxItemUi
 import com.example.domain.model.QualityReport
+import com.example.domain.model.SessionLifecycleState
 import com.example.domain.model.TelemetryRecordUi
 import com.example.eval.BatchEvaluationEngine
 import com.example.voice.ParsedVoiceCommand
@@ -29,6 +32,7 @@ import com.example.wearable.MockFeedScene
 import com.example.wearable.WearableGatewayState
 import com.example.wearable.WearableSessionGateway
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -42,6 +46,8 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.UUID
 
 private const val VM_TAG = "FieldCaptureViewModel"
@@ -49,6 +55,7 @@ private const val VM_TAG = "FieldCaptureViewModel"
 data class PendingQualityReview(
     val command: ParsedVoiceCommand,
     val bitmap: Bitmap,
+    val evidenceSource: EvidenceSource,
     val qualityReport: QualityReport
 )
 
@@ -66,7 +73,7 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     private val repository = FieldCaptureRepository(application)
     private val qualityAnalyzer = ImageQualityAnalyzer()
-    private val geminiService = GeminiExtractionService()
+    private val geminiService = GeminiExtractionService(application.applicationContext)
     private val evalEngine = BatchEvaluationEngine(application, qualityAnalyzer, geminiService, repository)
     private val wearableGateway: WearableSessionGateway = DatWearableSessionGateway(application)
 
@@ -76,6 +83,9 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     val wearableState: StateFlow<WearableGatewayState> = wearableGateway.state
     val voiceState: StateFlow<VoiceUiState> = voiceController.state
+
+    val isNetworkOnline: StateFlow<Boolean> = repository.observeNetworkOnline()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), repository.isNetworkConnected())
 
     private val _pipelineState = MutableStateFlow(CapturePipelineUiState())
     val pipelineState: StateFlow<CapturePipelineUiState> = _pipelineState.asStateFlow()
@@ -154,6 +164,8 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
                         }.onSuccess { previewReport ->
                             _pipelineState.value = _pipelineState.value.copy(liveQualityPreview = previewReport)
                         }
+                    } else {
+                        _pipelineState.value = _pipelineState.value.copy(liveQualityPreview = null)
                     }
                 }
         }
@@ -186,6 +198,12 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
     fun submitCommandText(rawCommand: String) {
         when (val parsed = VoiceCommandParser.parse(rawCommand)) {
             is VoiceParseResult.Matched -> executeParsedCommand(parsed.command)
+            is VoiceParseResult.MissingArguments -> {
+                _pipelineState.value = _pipelineState.value.copy(
+                    commandFeedback = parsed.hint,
+                    feedbackIsError = true
+                )
+            }
             is VoiceParseResult.Unrecognized -> {
                 _pipelineState.value = _pipelineState.value.copy(
                     commandFeedback = parsed.hint,
@@ -201,9 +219,32 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
         viewModelScope.launch {
             try {
+                val job = activeJob.value ?: repository.ensureDefaultJob()
+
                 if (command is ParsedVoiceCommand.TechnicianNote) {
-                    val attachedFrame = wearableState.value.previewFrame
-                    val dummyQuality = QualityReport(
+                    val isStreaming = wearableState.value.lifecycleState == SessionLifecycleState.STREAMING
+                    val attachedFrame = if (isStreaming) wearableState.value.previewFrame else null
+                    val noteSource = when {
+                        attachedFrame == null -> EvidenceSource.VOICE_NOTE_ONLY
+                        wearableState.value.hardware.usingDeviceCamera -> EvidenceSource.ANDROID_REAR_CAMERA_MOCK
+                        else -> EvidenceSource.MOCK_DEVICE_KIT_SCENE
+                    }
+                    val duplicate = repository.findDuplicateCapture(
+                        jobId = job.jobId,
+                        commandType = command.commandType,
+                        transcript = command.rawTranscript,
+                        room = null,
+                        surface = null,
+                        imageSha256 = null
+                    )
+                    if (duplicate != null) {
+                        _pipelineState.value = _pipelineState.value.copy(
+                            commandFeedback = "Duplicate note skipped — already logged in ${duplicate.captureId}.",
+                            feedbackIsError = true
+                        )
+                        return@launch
+                    }
+                    val noteQuality = QualityReport(
                         passed = true,
                         blurScore = 100.0,
                         brightnessScore = 128.0,
@@ -211,32 +252,40 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
                         darkPixelRatio = 0.0,
                         clippedPixelRatio = 0.0,
                         issues = emptyList(),
-                        summaryMessage = "Voice Note (visual context optional)",
+                        summaryMessage = if (attachedFrame != null) {
+                            "Voice Note (with active stream frame)"
+                        } else {
+                            "Voice Note (audio-only)"
+                        },
                         latencyMs = 1L
                     )
+                    val sha256 = attachedFrame?.let { repository.computeBitmapSha256(it) }
                     persistAndExtract(
+                        jobId = job.jobId,
                         command = command,
                         bitmap = attachedFrame,
-                        qualityReport = dummyQuality
+                        evidenceSource = noteSource,
+                        qualityReport = noteQuality,
+                        imageSha256 = sha256
                     )
                     return@launch
                 }
 
-                if (!wearableState.value.hardware.paired) {
+                // Require paired glasses AND active STREAMING state before capturing photo evidence
+                val gw = wearableState.value
+                if (!gw.hardware.paired) {
                     _pipelineState.value = _pipelineState.value.copy(
-                        activeStepMessage = "Pairing Mock Glasses via Meta DAT 1.0…",
-                        commandFeedback = null,
-                        feedbackIsError = false
+                        commandFeedback = "Mock glasses are not paired. Tap 'Pair Mock Glasses' and then 'Start' before capturing.",
+                        feedbackIsError = true
                     )
-                    val paired = wearableGateway.ensureMockGlassesPaired()
-                    if (!paired) {
-                        _pipelineState.value = _pipelineState.value.copy(
-                            activeStepMessage = null,
-                            commandFeedback = wearableState.value.lastError ?: "Unable to pair glasses for capture.",
-                            feedbackIsError = true
-                        )
-                        return@launch
-                    }
+                    return@launch
+                }
+                if (gw.lifecycleState != SessionLifecycleState.STREAMING) {
+                    _pipelineState.value = _pipelineState.value.copy(
+                        commandFeedback = "Live stream is ${gw.lifecycleState.name}. Tap 'Start' (or 'Resume') before capturing.",
+                        feedbackIsError = true
+                    )
+                    return@launch
                 }
 
                 _pipelineState.value = _pipelineState.value.copy(
@@ -252,21 +301,54 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
                         commandFeedback = "Capture failed: ${err.localizedMessage ?: "No camera frame available"}",
                         feedbackIsError = true
                     )
-                }.onSuccess { bmp ->
+                }.onSuccess { frame ->
                     _pipelineState.value = _pipelineState.value.copy(
                         activeStepMessage = "Running on-device quality gates (blur / darkness / framing)…"
                     )
-                    val qReport = qualityAnalyzer.analyze(bmp, command.commandType)
+                    val qReport = qualityAnalyzer.analyze(frame.bitmap, command.commandType)
                     if (!qReport.passed) {
                         _pipelineState.value = _pipelineState.value.copy(
                             activeStepMessage = null,
-                            pendingQualityReview = PendingQualityReview(command, bmp, qReport),
-                            commandFeedback = qReport.summaryMessage,
+                            pendingQualityReview = PendingQualityReview(
+                                command = command,
+                                bitmap = frame.bitmap,
+                                evidenceSource = frame.source,
+                                qualityReport = qReport
+                            ),
+                            commandFeedback = "${qReport.summaryMessage} — Adjust lighting/framing or retake.",
                             feedbackIsError = true
                         )
-                    } else {
-                        persistAndExtract(command, bmp, qReport)
+                        return@onSuccess
                     }
+
+                    val roomHint = (command as? ParsedVoiceCommand.CaptureDamage)?.room
+                    val surfaceHint = (command as? ParsedVoiceCommand.CaptureDamage)?.surface
+                    val sha256 = withContext(Dispatchers.Default) { repository.computeBitmapSha256(frame.bitmap) }
+                    val duplicate = repository.findDuplicateCapture(
+                        jobId = job.jobId,
+                        commandType = command.commandType,
+                        transcript = command.rawTranscript,
+                        room = roomHint,
+                        surface = surfaceHint,
+                        imageSha256 = sha256
+                    )
+                    if (duplicate != null) {
+                        _pipelineState.value = _pipelineState.value.copy(
+                            activeStepMessage = null,
+                            commandFeedback = "Duplicate capture blocked — ${duplicate.captureId} already captured for this frame/command. Switch scene or change room/surface.",
+                            feedbackIsError = true
+                        )
+                        return@onSuccess
+                    }
+
+                    persistAndExtract(
+                        jobId = job.jobId,
+                        command = command,
+                        bitmap = frame.bitmap,
+                        evidenceSource = frame.source,
+                        qualityReport = qReport,
+                        imageSha256 = sha256
+                    )
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -283,11 +365,21 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun overrideQualityAndKeep() {
+        if (_pipelineState.value.isExtracting || _pipelineState.value.activeStepMessage != null) return
         val pending = _pipelineState.value.pendingQualityReview ?: return
         _pipelineState.value = _pipelineState.value.copy(pendingQualityReview = null)
         viewModelScope.launch {
+            val job = activeJob.value ?: repository.ensureDefaultJob()
+            val sha256 = withContext(Dispatchers.Default) { repository.computeBitmapSha256(pending.bitmap) }
             val overriddenReport = pending.qualityReport.copy(userOverridden = true)
-            persistAndExtract(pending.command, pending.bitmap, overriddenReport)
+            persistAndExtract(
+                jobId = job.jobId,
+                command = pending.command,
+                bitmap = pending.bitmap,
+                evidenceSource = pending.evidenceSource,
+                qualityReport = overriddenReport,
+                imageSha256 = sha256
+            )
         }
     }
 
@@ -295,32 +387,121 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
         _pipelineState.value.pendingQualityReview ?: return
         _pipelineState.value = _pipelineState.value.copy(
             pendingQualityReview = null,
-            commandFeedback = "Discarded low-quality frame — adjust lighting/framing and retry.",
+            commandFeedback = "Discarded low-quality frame — hold steady, improve lighting, and retake.",
             feedbackIsError = false
         )
     }
 
+    fun retryExtraction(captureId: String) {
+        if (_pipelineState.value.isExtracting || _pipelineState.value.activeStepMessage != null) return
+        viewModelScope.launch {
+            val entity = repository.getCaptureEntity(captureId)
+            if (entity == null) {
+                _pipelineState.value = _pipelineState.value.copy(
+                    commandFeedback = "Cannot retry: capture $captureId no longer exists.",
+                    feedbackIsError = true
+                )
+                return@launch
+            }
+            val cmdType = runCatching { CaptureCommandType.valueOf(entity.commandType) }
+                .getOrDefault(CaptureCommandType.NOTE)
+
+            val bitmap = withContext(Dispatchers.IO) {
+                val path = entity.localImagePath ?: return@withContext null
+                val f = File(path)
+                if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+            }
+            if (entity.localImagePath != null && bitmap == null) {
+                _pipelineState.value = _pipelineState.value.copy(
+                    commandFeedback = "Cannot retry $captureId: local photo missing from storage.",
+                    feedbackIsError = true
+                )
+                return@launch
+            }
+
+            _pipelineState.value = _pipelineState.value.copy(
+                isExtracting = true,
+                activeStepMessage = "Retrying Gemini 3.8 Flash extraction for $captureId…",
+                commandFeedback = null,
+                feedbackIsError = false
+            )
+
+            val aiRes = geminiService.extractEvidence(
+                commandType = cmdType,
+                bitmap = bitmap,
+                transcript = entity.rawVoiceTranscript,
+                roomHint = entity.room,
+                surfaceHint = entity.surface
+            )
+
+            aiRes.onSuccess { outcome ->
+                repository.updateCaptureWithExtraction(
+                    captureId = captureId,
+                    bundle = outcome.bundle,
+                    errorMessage = null,
+                    aiLatencyMs = outcome.aiLatencyMs,
+                    promptTokens = outcome.promptTokens,
+                    outputTokens = outcome.outputTokens,
+                    estimatedCostUsd = outcome.estimatedCostUsd,
+                    qualityLatencyMs = 0L,
+                    sourceMode = "AI_RETRY"
+                )
+                _pipelineState.value = _pipelineState.value.copy(
+                    isExtracting = false,
+                    activeStepMessage = null,
+                    commandFeedback = "Retry succeeded for $captureId • Conf ${(outcome.bundle.overallConfidence * 100).toInt()}%",
+                    feedbackIsError = false
+                )
+            }.onFailure { err ->
+                val errMsg = err.localizedMessage ?: "AI extraction retry failed"
+                runCatching {
+                    repository.updateCaptureWithExtraction(
+                        captureId = captureId,
+                        bundle = null,
+                        errorMessage = errMsg,
+                        aiLatencyMs = 0L,
+                        promptTokens = 0,
+                        outputTokens = 0,
+                        estimatedCostUsd = 0.0,
+                        qualityLatencyMs = 0L,
+                        sourceMode = "AI_RETRY_FAIL"
+                    )
+                }
+                _pipelineState.value = _pipelineState.value.copy(
+                    isExtracting = false,
+                    activeStepMessage = null,
+                    commandFeedback = "Retry failed for $captureId: $errMsg",
+                    feedbackIsError = true
+                )
+            }
+        }
+    }
+
     private suspend fun persistAndExtract(
+        jobId: String,
         command: ParsedVoiceCommand,
         bitmap: Bitmap?,
-        qualityReport: QualityReport
+        evidenceSource: EvidenceSource,
+        qualityReport: QualityReport,
+        imageSha256: String?
     ) {
         val captureId = "CAP-${UUID.randomUUID().toString().take(8).uppercase()}"
         val roomHint = (command as? ParsedVoiceCommand.CaptureDamage)?.room
         val surfaceHint = (command as? ParsedVoiceCommand.CaptureDamage)?.surface
 
         try {
-            val job = activeJob.value ?: repository.ensureDefaultJob()
             val localPath = bitmap?.let { repository.saveCaptureImage(captureId, it) }
             repository.saveInitialCapture(
                 captureId = captureId,
-                jobId = job.jobId,
+                jobId = jobId,
                 commandType = command.commandType,
                 transcript = command.rawTranscript,
                 room = roomHint,
                 surface = surfaceHint,
                 localImagePath = localPath,
-                qualityReport = qualityReport
+                qualityReport = qualityReport,
+                evidenceSource = evidenceSource,
+                imageSha256 = imageSha256
             )
         } catch (e: CancellationException) {
             throw e
@@ -364,7 +545,7 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
                 _pipelineState.value = _pipelineState.value.copy(
                     isExtracting = false,
                     activeStepMessage = null,
-                    commandFeedback = "Saved $captureId • Conf ${(outcome.bundle.overallConfidence * 100).toInt()}% • ${outcome.aiLatencyMs}ms",
+                    commandFeedback = "Saved $captureId (${evidenceSource.displayLabel}) • Conf ${(outcome.bundle.overallConfidence * 100).toInt()}% • ${outcome.aiLatencyMs}ms",
                     feedbackIsError = false
                 )
             } catch (e: CancellationException) {
@@ -459,8 +640,6 @@ class FieldCaptureViewModel(application: Application) : AndroidViewModel(applica
             repository.clearSyncedOutbox()
         }
     }
-
-    fun isNetworkConnected(): Boolean = repository.isNetworkConnected()
 
     // --- 40-Frame Batch Evaluator & Cost/Latency Telemetry ---
     fun addImportedEvalUris(uris: List<Uri>) {

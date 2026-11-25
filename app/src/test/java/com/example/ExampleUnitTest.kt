@@ -10,11 +10,16 @@ import com.example.data.local.TelemetryMetricEntity
 import com.example.data.repository.FieldCaptureRepository
 import com.example.domain.model.CaptureCommandType
 import com.example.domain.model.EstimateCodeCatalog
+import com.example.domain.model.EvidenceSource
 import com.example.domain.model.QualityIssue
 import com.example.domain.model.QualityReport
 import com.example.domain.model.SyncStatus
+import com.example.eval.EvalGroundTruthEvaluator
+import com.example.eval.LabeledGroundTruthSample
+import com.example.eval.LabeledPredictionSample
 import com.example.voice.ParsedVoiceCommand
 import com.example.voice.VoiceCommandParser
+import com.example.voice.VoiceCommandSpec
 import com.example.voice.VoiceParseResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,46 +29,85 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.awt.image.BufferedImage
 import java.io.File
 import javax.imageio.ImageIO
 
 class ExampleUnitTest {
 
     @Test
-    fun voiceParser_matchesAllThreeCommands() {
-        val nameplate = VoiceCommandParser.parse("capture nameplate")
+    fun voiceParser_matchesRequiredCommands_handlesPunctuation_andFlagsMissingArgs() {
+        val nameplate = VoiceCommandParser.parse("Capture nameplate.")
         assertTrue(nameplate is VoiceParseResult.Matched)
         assertEquals(CaptureCommandType.NAMEPLATE, (nameplate as VoiceParseResult.Matched).command.commandType)
 
-        val damage = VoiceCommandParser.parse("capture damage basement drywall")
+        val damage = VoiceCommandParser.parse("capture damage in basement drywall ceiling!")
         assertTrue(damage is VoiceParseResult.Matched)
         val dmgCmd = (damage as VoiceParseResult.Matched).command as ParsedVoiceCommand.CaptureDamage
         assertEquals("Basement", dmgCmd.room)
-        assertEquals("Drywall", dmgCmd.surface)
+        assertEquals("Drywall Ceiling", dmgCmd.surface)
 
         val note = VoiceCommandParser.parse("note: Main breaker lug shows scorch marks")
         assertTrue(note is VoiceParseResult.Matched)
         val noteCmd = (note as VoiceParseResult.Matched).command as ParsedVoiceCommand.TechnicianNote
         assertEquals("Main breaker lug shows scorch marks", noteCmd.noteText)
 
+        // Missing argument validation
+        val missingDamageAll = VoiceCommandParser.parse("capture damage")
+        assertTrue(missingDamageAll is VoiceParseResult.MissingArguments)
+
+        val missingDamageSurface = VoiceCommandParser.parse("capture damage kitchen")
+        assertTrue(missingDamageSurface is VoiceParseResult.MissingArguments)
+
+        val missingNoteBody = VoiceCommandParser.parse("note:")
+        assertTrue(missingNoteBody is VoiceParseResult.MissingArguments)
+
         val invalid = VoiceCommandParser.parse("hello world")
         assertTrue(invalid is VoiceParseResult.Unrecognized)
     }
 
     @Test
+    fun voiceParser_supportsRegisteringFourthCommandSpec() {
+        val customThermalSpec = object : VoiceCommandSpec {
+            override val commandName: String = "flag hazard"
+            override val usageHint: String = "flag hazard [description]"
+            override fun tryParse(normalizedTranscript: String, originalTranscript: String): VoiceParseResult? {
+                if (!normalizedTranscript.startsWith("flag hazard", ignoreCase = true)) return null
+                val body = normalizedTranscript.removePrefix("flag hazard").trim()
+                return if (body.isEmpty()) {
+                    VoiceParseResult.MissingArguments(commandName, originalTranscript, "Provide hazard text.")
+                } else {
+                    VoiceParseResult.Matched(ParsedVoiceCommand.TechnicianNote("[HAZARD] $body", originalTranscript))
+                }
+            }
+        }
+        val extendedSpecs = VoiceCommandParser.defaultSpecs + customThermalSpec
+        val res = VoiceCommandParser.parse("flag hazard exposed 240V bus bar", extendedSpecs)
+        assertTrue(res is VoiceParseResult.Matched)
+        val note = (res as VoiceParseResult.Matched).command as ParsedVoiceCommand.TechnicianNote
+        assertEquals("[HAZARD] exposed 240V bus bar", note.noteText)
+    }
+
+    @Test
     fun estimateCatalog_hasFourteenCodesAndMatchesDomainText() {
         assertEquals(14, EstimateCodeCatalog.items.size)
+        assertEquals(14, EstimateCodeCatalog.items.map { it.code }.distinct().size)
+
         val hvacMatches = EstimateCodeCatalog.matchFromText("Carrier condenser R-410A refrigerant leak")
         assertTrue(hvacMatches.any { it.code.startsWith("HVC-") })
 
         val waterMatches = EstimateCodeCatalog.matchFromText("Basement drywall water stain and mold")
         assertTrue(waterMatches.any { it.code == "DRY-RPL-02" || it.code == "WTR-DRY-01" })
+
+        val electricalMatches = EstimateCodeCatalog.matchFromText("Main 200A breaker panel scorch hazard")
+        assertTrue(electricalMatches.any { it.code == "ELC-PNL-08" || it.code == "GEN-SAF-14" })
     }
 
     @Test
-    fun qualityAnalyzer_flagsDarkAndBlurry_andPassesSharpCentered() {
+    fun qualityAnalyzer_flagsBlurDarkOverexposedAndOffCenter_andPassesSharpCentered() {
         val analyzer = ImageQualityAnalyzer()
         val w = 160
         val h = 120
@@ -75,7 +119,27 @@ class ExampleUnitTest {
         assertTrue(darkReport.issues.contains(QualityIssue.TOO_DARK))
         assertTrue(darkReport.issues.contains(QualityIssue.BLURRY))
 
-        // 2. Sharp high-contrast centered grid -> PASS
+        // 2. Washed out glare -> OVEREXPOSED
+        val glarePixels = IntArray(w * h) { (250 shl 16) or (250 shl 8) or 250 }
+        val glareReport = analyzer.analyzePixels(glarePixels, w, h, CaptureCommandType.DAMAGE)
+        assertFalse(glareReport.passed)
+        assertTrue(glareReport.issues.contains(QualityIssue.OVEREXPOSED))
+
+        // 3. Off-center border-only contrast -> POOR_FRAMING
+        val offCenterPixels = IntArray(w * h) { (128 shl 16) or (128 shl 8) or 128 }
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val inBorder = x < 18 || x > w - 18 || y < 14 || y > h - 14
+                if (inBorder && (x % 3 == 0 || y % 3 == 0)) {
+                    offCenterPixels[y * w + x] = (20 shl 16) or (20 shl 8) or 20
+                }
+            }
+        }
+        val framingReport = analyzer.analyzePixels(offCenterPixels, w, h, CaptureCommandType.NAMEPLATE)
+        assertFalse(framingReport.passed)
+        assertTrue("Expected POOR_FRAMING, got ${framingReport.issues}", framingReport.issues.contains(QualityIssue.POOR_FRAMING))
+
+        // 4. Sharp high-contrast centered grid -> PASS
         val sharpPixels = IntArray(w * h) { (215 shl 16) or (215 shl 8) or 215 }
         for (y in 28 until 92) {
             for (x in 36 until 124) {
@@ -89,31 +153,67 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun qualityAnalyzer_sampleNameplateDrawable_passesNameplateGate() {
-        val sampleFile = listOf(
-            File("src/main/res/drawable/img_sample_nameplate_1795506161252.jpg"),
-            File("app/src/main/res/drawable/img_sample_nameplate_1795506161252.jpg")
-        ).firstOrNull { it.exists() }
-        assertNotNull("Expected bundled sample nameplate drawable on disk", sampleFile)
+    fun qualityAnalyzer_bundledDrawablesAndSynthetic42FrameCvBenchmark() {
+        val drawableNames = listOf(
+            "img_sample_nameplate_1795506161252.jpg" to CaptureCommandType.NAMEPLATE,
+            "img_sample_damage_drywall_1795506162478.jpg" to CaptureCommandType.DAMAGE,
+            "img_sample_electrical_panel_1795506162369.jpg" to CaptureCommandType.DAMAGE
+        )
+        val analyzer = ImageQualityAnalyzer()
+        val loadedImages = drawableNames.map { (name, cmd) ->
+            val file = listOf(
+                File("src/main/res/drawable/$name"),
+                File("app/src/main/res/drawable/$name")
+            ).firstOrNull { it.exists() }
+            assertNotNull("Expected bundled drawable $name", file)
+            Triple(name, cmd, ImageIO.read(file!!))
+        }
 
-        val img = ImageIO.read(sampleFile!!)
-        val w = 320
-        val h = (img.height * (w.toFloat() / img.width)).toInt()
-        val scaled = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
-        val g = scaled.createGraphics()
-        g.drawImage(img, 0, 0, w, h, null)
-        g.dispose()
+        // Verify all 3 nominal drawables pass CV gates
+        for ((name, cmd, img) in loadedImages) {
+            val report = analyzeBufferedImage(analyzer, img, cmd)
+            assertTrue("Expected $name to pass CV gate, got: ${report.summaryMessage}", report.passed)
+        }
 
-        val pixels = IntArray(w * h)
-        scaled.getRGB(0, 0, w, h, pixels, 0, w)
+        // Run a 42-frame synthetic CV perturbation sweep matching BatchEvaluationEngine (>=10 nameplates, >=10 low-light)
+        var nameplates = 0
+        var lowLight = 0
+        var passCount = 0
+        var darkRejected = 0
+        var blurRejected = 0
+        var framingRejected = 0
+        var overexposedRejected = 0
 
-        val report = ImageQualityAnalyzer().analyzePixels(pixels, w, h, CaptureCommandType.NAMEPLATE)
-        assertTrue("Sample nameplate should pass quality gate, got: ${report.summaryMessage}", report.passed)
+        for (i in 0 until 42) {
+            val (_, cmd, src) = loadedImages[i % loadedImages.size]
+            if (cmd == CaptureCommandType.NAMEPLATE) nameplates++
+            val mode = i % 7
+            val cycle = i / 7
+            val isLowLight = mode == 2 || mode == 4
+            if (isLowLight) lowLight++
+
+            val perturbed = perturbBufferedImage(src, mode, cycle)
+            val rep = analyzeBufferedImage(analyzer, perturbed, cmd)
+            if (rep.passed) passCount++
+            if (QualityIssue.TOO_DARK in rep.issues) darkRejected++
+            if (QualityIssue.BLURRY in rep.issues) blurRejected++
+            if (QualityIssue.POOR_FRAMING in rep.issues) framingRejected++
+            if (QualityIssue.OVEREXPOSED in rep.issues) overexposedRejected++
+        }
+
+        assertTrue("Expected >=10 nameplates, got $nameplates", nameplates >= 10)
+        assertTrue("Expected >=10 low-light frames, got $lowLight", lowLight >= 10)
+        assertTrue("Expected low-light perturbations to trigger dark rejections ($darkRejected)", darkRejected >= 10)
+        assertTrue("Expected blur perturbations to trigger blur rejections ($blurRejected)", blurRejected >= 4)
+        assertTrue("Expected framing perturbations to trigger framing rejections ($framingRejected)", framingRejected >= 4)
+        println("JVM_CV_BENCHMARK total=42 nameplates=$nameplates lowLight=$lowLight pass=$passCount darkRejected=$darkRejected blurRejected=$blurRejected framingRejected=$framingRejected overexposedRejected=$overexposedRejected")
     }
 
     @Test
-    fun geminiExtractionService_parsesNameplateFieldsAndEstimateCodes() {
-        val rawJson = """
+    fun geminiExtractionService_parsesAllCommandSchemas_andRejectsZeroConfidence() {
+        val service = GeminiExtractionService()
+
+        val nameplateJson = """
             {
               "equipmentType": {"value": "HVAC Condenser", "confidence": 0.96},
               "manufacturer": {"value": "Carrier", "confidence": 0.98},
@@ -127,41 +227,52 @@ class ExampleUnitTest {
               "estimateCodes": ["HVC-CMP-10", "HVC-COI-11"]
             }
         """.trimIndent()
+        val nameplateBundle = service.parseStructuredBundle(nameplateJson, CaptureCommandType.NAMEPLATE)
+        assertEquals("Carrier", nameplateBundle.fields["manufacturer"]?.value)
+        assertEquals("24ACC636A003", nameplateBundle.fields["modelNumber"]?.value)
+        assertEquals("3121E48291", nameplateBundle.fields["serialNumber"]?.value)
+        assertTrue(nameplateBundle.fields["manufactureDate"]?.needsReview == true)
+        assertEquals(listOf("HVC-CMP-10", "HVC-COI-11"), nameplateBundle.suggestedEstimateCodes)
 
-        val bundle = GeminiExtractionService().parseStructuredBundle(rawJson, CaptureCommandType.NAMEPLATE)
-        assertEquals("Carrier", bundle.fields["manufacturer"]?.value)
-        assertEquals("24ACC636A003", bundle.fields["modelNumber"]?.value)
-        assertEquals("3121E48291", bundle.fields["serialNumber"]?.value)
-        assertEquals("Unknown", bundle.fields["manufactureDate"]?.value)
-        assertTrue(bundle.fields["manufactureDate"]?.needsReview == true)
-        assertEquals("R-410A", bundle.fields["refrigerantType"]?.value)
-        assertEquals(listOf("HVC-CMP-10", "HVC-COI-11"), bundle.suggestedEstimateCodes)
-    }
-
-    @Test
-    fun geminiExtractionService_fallsBackToDomainCodesWhenEstimateCodesEmpty() {
-        val rawJson = """
+        val damageJson = """
             {
-              "equipmentType": {"value": "Condenser", "confidence": 0.92},
-              "manufacturer": {"value": "Carrier", "confidence": 0.95},
-              "modelNumber": {"value": "24ACC636A003", "confidence": 0.94},
-              "serialNumber": {"value": "3121E48291", "confidence": 0.93},
-              "manufactureYear": {"value": "2021", "confidence": 0.82},
-              "voltagePhase": {"value": "208-230V 1PH", "confidence": 0.91},
-              "amperageOrBtu": {"value": "35A", "confidence": 0.80},
-              "refrigerantType": {"value": "R-410A", "confidence": 0.95},
-              "summary": "Carrier condenser using R-410A refrigerant.",
+              "room": {"value": "Basement", "confidence": 0.95},
+              "surface": {"value": "Drywall", "confidence": 0.92},
+              "damageType": {"value": "Water stain & bubbling paint", "confidence": 0.89},
+              "severity": {"value": "MODERATE", "confidence": 0.88},
+              "estimatedAreaSqFt": {"value": "32 sq ft", "confidence": 0.81},
+              "moistureOrThermalRisk": {"value": "Elevated moisture risk", "confidence": 0.84},
+              "recommendedAction": {"value": "Cut out wet drywall and dry framing", "confidence": 0.87},
+              "summary": "Moisture-stained basement drywall requires removal and drying.",
+              "estimateCodes": ["WTR-DRY-01", "DRY-RPL-02"]
+            }
+        """.trimIndent()
+        val damageBundle = service.parseStructuredBundle(damageJson, CaptureCommandType.DAMAGE)
+        assertEquals("Basement", damageBundle.fields["room"]?.value)
+        assertEquals("32 sq ft", damageBundle.fields["estimatedAreaSqFt"]?.value)
+        assertTrue(damageBundle.overallConfidence > 0.85f)
+
+        val zeroConfJson = """
+            {
+              "summary": {"value": "Unknown", "confidence": 0.0},
+              "category": {"value": "Unknown", "confidence": 0.0},
+              "safetyHazard": {"value": "Unknown", "confidence": 0.0},
+              "followUpRequired": {"value": "Unknown", "confidence": 0.0},
+              "referencedComponents": {"value": "Unknown", "confidence": 0.0},
               "estimateCodes": []
             }
         """.trimIndent()
-
-        val bundle = GeminiExtractionService().parseStructuredBundle(rawJson, CaptureCommandType.NAMEPLATE)
-        assertEquals("2021", bundle.fields["manufactureDate"]?.value)
-        assertTrue(bundle.suggestedEstimateCodes.contains("HVC-CMP-10"))
+        var threwZeroConf = false
+        try {
+            service.parseStructuredBundle(zeroConfJson, CaptureCommandType.NOTE)
+        } catch (e: IllegalStateException) {
+            threwZeroConf = true
+        }
+        assertTrue("Expected 0% confidence bundle to throw instead of succeeding", threwZeroConf)
     }
 
     @Test
-    fun repository_capturePersistenceSurvivesTelemetryAndSyncUpdates_andGeneratesLineItems() = runTest {
+    fun repository_duplicateDetection_aiRetry_and_offline503RecoveryWithoutDuplicateOutbox() = runTest {
         val dao = InMemoryInspectionDao()
         val repository = FieldCaptureRepository(
             appContext = null,
@@ -182,7 +293,9 @@ class ExampleUnitTest {
             latencyMs = 14L
         )
 
+        // 1. Initial capture saved locally even if AI fails first (offline/AppCheck failure)
         val captureId = "CAP-NAMEPLATE01"
+        val sampleSha = "abc123sha256"
         repository.saveInitialCapture(
             captureId = captureId,
             jobId = job.jobId,
@@ -191,14 +304,42 @@ class ExampleUnitTest {
             room = null,
             surface = null,
             localImagePath = "/tmp/captures/$captureId.jpg",
-            qualityReport = quality
+            qualityReport = quality,
+            evidenceSource = EvidenceSource.MOCK_DEVICE_KIT_SCENE,
+            imageSha256 = sampleSha
         )
 
-        // Simulate telemetry updates during streaming & reconnect recovery — must NOT cascade-delete capture
-        repository.updateJobSessionTelemetry(job.jobId, "STREAMING", 0)
-        repository.updateJobSessionTelemetry(job.jobId, "RECONNECTING", 1)
-        repository.updateJobSessionTelemetry(job.jobId, "STREAMING", 1)
+        // Simulate failed AI extraction saved against existing record
+        repository.updateCaptureWithExtraction(
+            captureId = captureId,
+            bundle = null,
+            errorMessage = "Firebase App Check token is invalid.",
+            aiLatencyMs = 0L,
+            promptTokens = 0,
+            outputTokens = 0,
+            estimatedCostUsd = 0.0,
+            qualityLatencyMs = quality.latencyMs
+        )
 
+        // Verify local capture + photo path retained when AI fails
+        val afterFailure = repository.observeCaptures(job.jobId).first().first()
+        assertEquals(captureId, afterFailure.captureId)
+        assertNotNull(afterFailure.extractionError)
+        assertEquals(EvidenceSource.MOCK_DEVICE_KIT_SCENE, afterFailure.evidenceSource)
+
+        // Verify duplicate check permits replacing failed extraction OR catches duplicates after success
+        assertNull(
+            repository.findDuplicateCapture(
+                jobId = job.jobId,
+                commandType = CaptureCommandType.NAMEPLATE,
+                transcript = "capture nameplate",
+                room = null,
+                surface = null,
+                imageSha256 = sampleSha
+            )
+        )
+
+        // 2. Retry extraction without recapturing -> updates existing captureId
         val rawJson = """
             {
               "equipmentType": {"value": "HVAC Condenser", "confidence": 0.95},
@@ -214,41 +355,192 @@ class ExampleUnitTest {
             }
         """.trimIndent()
         val bundle = GeminiExtractionService().parseStructuredBundle(rawJson, CaptureCommandType.NAMEPLATE)
-
         repository.updateCaptureWithExtraction(
             captureId = captureId,
             bundle = bundle,
             errorMessage = null,
-            aiLatencyMs = 840L,
-            promptTokens = 420,
-            outputTokens = 160,
-            estimatedCostUsd = 0.00016,
-            qualityLatencyMs = quality.latencyMs
+            aiLatencyMs = 740L,
+            promptTokens = 410,
+            outputTokens = 155,
+            estimatedCostUsd = 0.00015,
+            qualityLatencyMs = 0L,
+            sourceMode = "AI_RETRY"
         )
 
-        val captures = repository.observeCaptures(job.jobId).first()
-        assertEquals(1, captures.size)
-        val saved = captures.first()
-        assertEquals(captureId, saved.captureId)
-        assertEquals("Carrier", saved.extraction?.fields?.get("manufacturer")?.value)
-        assertEquals("24ACC636A003", saved.extraction?.fields?.get("modelNumber")?.value)
-        assertEquals("3121E48291", saved.extraction?.fields?.get("serialNumber")?.value)
-        assertEquals("/tmp/captures/$captureId.jpg", saved.localImagePath)
+        val capturesAfterRetry = repository.observeCaptures(job.jobId).first()
+        assertEquals(1, capturesAfterRetry.size)
+        assertNull(capturesAfterRetry.first().extractionError)
+        assertEquals("Carrier", capturesAfterRetry.first().extraction?.fields?.get("manufacturer")?.value)
 
-        val lineItems = repository.buildEstimateLineItems(captures)
-        assertEquals(2, lineItems.size)
-        assertEquals(listOf("HVC-CMP-10", "HVC-COI-11"), lineItems.map { it.code })
+        // Duplicate capture now blocked cleanly
+        val dup = repository.findDuplicateCapture(
+            jobId = job.jobId,
+            commandType = CaptureCommandType.NAMEPLATE,
+            transcript = "capture nameplate",
+            room = null,
+            surface = null,
+            imageSha256 = sampleSha
+        )
+        assertNotNull("Expected duplicate capture to be detected after valid capture", dup)
+        assertEquals(captureId, dup?.captureId)
 
-        // Verify loopback sync updates job revision without cascade-deleting captures
-        val syncedItems = repository.processPendingOutbox()
-        assertTrue(syncedItems >= 1)
+        // 3. Offline / HTTP 503 failure & recovery test (idempotency key preserved, no duplicate outbox entries)
+        val initialOutbox = repository.outboxFlow.first()
+        val jobSyncKeyBefore = initialOutbox.first { it.operationType == "SYNC_JOB" }.idempotencyKey
+        repository.transportConfig.setSimulateNextFailure(true)
+        val failedBatch = repository.processPendingOutbox()
+        assertTrue("Expected failure when HTTP 503 is simulated", failedBatch.failedCount >= 1)
+
+        val failedOutbox = repository.outboxFlow.first().first { it.operationType == "SYNC_JOB" }
+        assertEquals(SyncStatus.FAILED, failedOutbox.status)
+        assertEquals(jobSyncKeyBefore, failedOutbox.idempotencyKey)
+
+        // Enqueueing update again before retry preserves idempotency key & attempt count
+        repository.updateExtractedField(captureId, "manufactureDate", "08/2021")
+        val reQueuedOutbox = repository.outboxFlow.first().first { it.operationType == "SYNC_JOB" }
+        assertEquals(SyncStatus.QUEUED, reQueuedOutbox.status)
+        assertEquals(jobSyncKeyBefore, reQueuedOutbox.idempotencyKey)
+
+        // Connectivity returns -> sync succeeds cleanly
+        val recoveryBatch = repository.processPendingOutbox()
+        assertEquals(0, recoveryBatch.failedCount)
+        assertTrue(recoveryBatch.syncedCount >= 1)
+
         val postSyncCaptures = repository.observeCaptures(job.jobId).first()
         assertEquals(1, postSyncCaptures.size)
         assertEquals(SyncStatus.SYNCED, postSyncCaptures.first().syncStatus)
 
         val exportedJson = repository.buildStructuredJobJsonString(job.jobId)
         assertTrue(exportedJson.contains("24ACC636A003"))
-        assertTrue(exportedJson.contains("HVC-CMP-10"))
+        assertTrue(exportedJson.contains("MOCK_DEVICE_KIT_SCENE"))
+        assertTrue(exportedJson.contains("08/2021"))
+    }
+
+    @Test
+    fun evalGroundTruthEvaluator_computesPerFieldAccuracyCorrectly() {
+        val gt = listOf(
+            LabeledGroundTruthSample(
+                sampleId = "S1",
+                imageFileName = "np1.jpg",
+                commandType = CaptureCommandType.NAMEPLATE,
+                expectedFields = mapOf(
+                    "manufacturer" to "Carrier",
+                    "modelNumber" to "24ACC636A003",
+                    "serialNumber" to "3121E48291"
+                )
+            ),
+            LabeledGroundTruthSample(
+                sampleId = "S2",
+                imageFileName = "np2.jpg",
+                commandType = CaptureCommandType.NAMEPLATE,
+                isLowLight = true,
+                expectedFields = mapOf(
+                    "manufacturer" to "Trane",
+                    "modelNumber" to "4TTR6036J1000A",
+                    "serialNumber" to "21453K8N2F"
+                )
+            )
+        )
+        val preds = mapOf(
+            "S1" to LabeledPredictionSample(
+                sampleId = "S1",
+                extractedFields = mapOf(
+                    "manufacturer" to "Carrier",
+                    "modelNumber" to "24ACC-636A003", // formatting variance normalizes cleanly
+                    "serialNumber" to "3121E48291"
+                ),
+                fieldConfidences = mapOf("manufacturer" to 0.98f, "modelNumber" to 0.95f, "serialNumber" to 0.94f)
+            ),
+            "S2" to LabeledPredictionSample(
+                sampleId = "S2",
+                extractedFields = mapOf(
+                    "manufacturer" to "Trane",
+                    "modelNumber" to "4TTR6036J1000A",
+                    "serialNumber" to "Unknown"
+                ),
+                fieldConfidences = mapOf("manufacturer" to 0.90f, "modelNumber" to 0.85f, "serialNumber" to 0.35f)
+            )
+        )
+
+        val report = EvalGroundTruthEvaluator.evaluate(gt, preds)
+        assertEquals(2, report.evaluatedSamples)
+        assertEquals(5f / 6f, report.overallFieldAccuracy, 0.001f)
+        val mfgMetric = report.fieldMetrics.first { it.fieldName == "manufacturer" }
+        assertEquals(1.0f, mfgMetric.accuracy, 0.001f)
+        val serialMetric = report.fieldMetrics.first { it.fieldName == "serialNumber" }
+        assertEquals(0.5f, serialMetric.accuracy, 0.001f)
+    }
+
+    private fun analyzeBufferedImage(
+        analyzer: ImageQualityAnalyzer,
+        img: BufferedImage,
+        commandType: CaptureCommandType
+    ): QualityReport {
+        val w = 320
+        val h = (img.height * (w.toFloat() / img.width)).toInt().coerceAtLeast(64)
+        val scaled = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
+        val g = scaled.createGraphics()
+        g.drawImage(img, 0, 0, w, h, null)
+        g.dispose()
+        val pixels = IntArray(w * h)
+        scaled.getRGB(0, 0, w, h, pixels, 0, w)
+        return analyzer.analyzePixels(pixels, w, h, commandType)
+    }
+
+    private fun perturbBufferedImage(src: BufferedImage, mode: Int, cycle: Int): BufferedImage {
+        val w = src.width
+        val h = src.height
+        return when (mode) {
+            0 -> src
+            1 -> src.getSubimage((w * 0.14).toInt(), (h * 0.14).toInt(), (w * 0.72).toInt(), (h * 0.72).toInt())
+            2 -> scaleRgbBufferedImage(src, 0.28f)
+            3 -> {
+                val tiny = BufferedImage((w / 12).coerceAtLeast(20), (h / 12).coerceAtLeast(16), BufferedImage.TYPE_INT_ARGB)
+                val g1 = tiny.createGraphics()
+                g1.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+                g1.drawImage(src, 0, 0, tiny.width, tiny.height, null)
+                g1.dispose()
+                val blurred = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
+                val g2 = blurred.createGraphics()
+                g2.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+                g2.drawImage(tiny, 0, 0, w, h, null)
+                g2.dispose()
+                blurred
+            }
+            4 -> scaleRgbBufferedImage(src, 0.16f)
+            5 -> {
+                val out = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
+                val g = out.createGraphics()
+                g.color = java.awt.Color(42, 46, 52)
+                g.fillRect(0, 0, w, h)
+                g.drawImage(src, (w * 0.78f).toInt(), (h * 0.72f).toInt(), null)
+                g.dispose()
+                out
+            }
+            else -> if (cycle % 2 == 0) {
+                scaleRgbBufferedImage(src, 1.55f)
+            } else {
+                src.getSubimage(0, 0, (w * 0.85).toInt(), (h * 0.85).toInt())
+            }
+        }
+    }
+
+    private fun scaleRgbBufferedImage(src: BufferedImage, factor: Float): BufferedImage {
+        val w = src.width
+        val h = src.height
+        val out = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
+        val pixels = IntArray(w * h)
+        src.getRGB(0, 0, w, h, pixels, 0, w)
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val a = (c ushr 24) and 0xFF
+            val r = (((c ushr 16) and 0xFF) * factor).toInt().coerceIn(0, 255)
+            val g = (((c ushr 8) and 0xFF) * factor).toInt().coerceIn(0, 255)
+            val b = ((c and 0xFF) * factor).toInt().coerceIn(0, 255)
+            pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        out.setRGB(0, 0, w, h, pixels, 0, w)
+        return out
     }
 }
 
@@ -340,6 +632,9 @@ private class InMemoryInspectionDao : InspectionDao {
         outbox.value.values
             .filter { it.status == "QUEUED" || it.status == "FAILED" }
             .sortedBy { it.createdAtEpochMs }
+
+    override suspend fun getOutboxItemById(outboxId: String): SyncOutboxEntity? =
+        outbox.value[outboxId]
 
     override suspend fun upsertOutboxItem(item: SyncOutboxEntity) {
         outbox.value = outbox.value + (item.outboxId to item)

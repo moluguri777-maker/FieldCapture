@@ -90,6 +90,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.R
 import com.example.data.local.InspectionJobEntity
+import com.example.domain.model.QualityIssue
 import com.example.domain.model.QualityReport
 import com.example.domain.model.SessionLifecycleState
 import com.example.ui.theme.ElectricCyan
@@ -312,19 +313,43 @@ fun CaptureDeckScreen(
                         if (wearableState.hardware.paired) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.BatteryChargingFull,
-                                    contentDescription = "Glasses battery",
-                                    tint = StatusEmerald,
-                                    modifier = Modifier.size(15.dp)
-                                )
-                                Text(
-                                    text = "${wearableState.hardware.batteryPercent}%",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = Color.White
-                                )
+                                Surface(
+                                    color = if (wearableState.hardware.usingDeviceCamera) {
+                                        StatusEmerald.copy(alpha = 0.25f)
+                                    } else {
+                                        StatusAmber.copy(alpha = 0.25f)
+                                    },
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = if (wearableState.hardware.usingDeviceCamera) {
+                                            "REAR CAM BRIDGE"
+                                        } else {
+                                            "MOCK SAMPLE"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.BatteryChargingFull,
+                                        contentDescription = "Glasses battery",
+                                        tint = StatusEmerald,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Text(
+                                        text = "${wearableState.hardware.batteryPercent}%",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.White
+                                    )
+                                }
                             }
                         }
                     }
@@ -482,6 +507,7 @@ fun CaptureDeckScreen(
             pipelineState.pendingQualityReview?.let { pending ->
                 QualityGateAlertCard(
                     pending = pending,
+                    busy = pipelineState.isExtracting || pipelineState.activeStepMessage != null,
                     onOverride = onOverrideQuality,
                     onDiscard = onDiscardQuality
                 )
@@ -899,9 +925,18 @@ private fun LiveQualityStrip(
 @Composable
 private fun QualityGateAlertCard(
     pending: PendingQualityReview,
+    busy: Boolean,
     onOverride: () -> Unit,
     onDiscard: () -> Unit
 ) {
+    val retakeTips = pending.qualityReport.issues.map { issue ->
+        when (issue) {
+            QualityIssue.BLURRY -> "• Hold head still for 0.5s and step within 18 inches for sharp text."
+            QualityIssue.TOO_DARK -> "• Turn on room lighting or flashlight — frame is too dark."
+            QualityIssue.OVEREXPOSED -> "• Tilt angle slightly to reduce direct glare/specular reflection."
+            QualityIssue.POOR_FRAMING -> "• Center the nameplate or damaged area inside the reticle brackets."
+        }
+    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -918,7 +953,7 @@ private fun QualityGateAlertCard(
                     tint = MaterialTheme.colorScheme.onErrorContainer
                 )
                 Text(
-                    text = "On-Device Quality Gate Triggered",
+                    text = "Retake Recommended — Quality Gate Failed",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onErrorContainer
                 )
@@ -928,12 +963,20 @@ private fun QualityGateAlertCard(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer
             )
+            if (retakeTips.isNotEmpty()) {
+                Text(
+                    text = retakeTips.joinToString("\n"),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
                     onClick = onDiscard,
+                    enabled = !busy,
                     modifier = Modifier
                         .weight(1f)
                         .heightIn(min = 48.dp)
@@ -943,6 +986,7 @@ private fun QualityGateAlertCard(
                 }
                 Button(
                     onClick = onOverride,
+                    enabled = !busy,
                     modifier = Modifier
                         .weight(1f)
                         .heightIn(min = 48.dp)

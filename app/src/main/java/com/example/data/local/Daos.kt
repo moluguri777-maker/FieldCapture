@@ -68,6 +68,9 @@ interface InspectionDao {
     @Query("SELECT * FROM sync_outbox WHERE status IN ('QUEUED', 'FAILED') ORDER BY createdAtEpochMs ASC")
     suspend fun getPendingOutboxItems(): List<SyncOutboxEntity>
 
+    @Query("SELECT * FROM sync_outbox WHERE outboxId = :outboxId")
+    suspend fun getOutboxItemById(outboxId: String): SyncOutboxEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertOutboxItem(item: SyncOutboxEntity)
 
