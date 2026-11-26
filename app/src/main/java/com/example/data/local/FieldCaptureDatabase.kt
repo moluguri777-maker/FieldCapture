@@ -1,3 +1,4 @@
+
 package com.example.data.local
 
 import android.content.Context
@@ -14,10 +15,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SyncOutboxEntity::class,
         TelemetryMetricEntity::class
     ],
-    version = 2,
-    exportSchema = false
+    version = 4,
+    exportSchema = true
 )
 abstract class FieldCaptureDatabase : RoomDatabase() {
+
     abstract fun inspectionDao(): InspectionDao
 
     companion object {
@@ -35,13 +37,32 @@ abstract class FieldCaptureDatabase : RoomDatabase() {
             }
         }
 
+        // Version 2 already contains the two columns.
+        // This migration preserves the existing data and allows
+        // Room to validate the updated version 3 schema.
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // No physical schema changes required.
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // No physical schema changes.
+                // Room will validate the existing schema.
+            }
+        }
+
         fun getInstance(context: Context): FieldCaptureDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     FieldCaptureDatabase::class.java,
                     "fieldcapture.db"
-                ).addMigrations(MIGRATION_1_2).build().also { INSTANCE = it }
+                )
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .build()
+                    .also { INSTANCE = it }
             }
         }
     }
